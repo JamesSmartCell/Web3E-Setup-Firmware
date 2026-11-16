@@ -244,7 +244,7 @@ bool queryProxyForFirmware() {
     Serial.println("Proxy response received, parsing JSON...");
     
     // Parse JSON response
-    StaticJsonDocument<1024> doc;
+    JsonDocument doc;
     DeserializationError error = deserializeJson(doc, payload);
     
     if (error) {
@@ -254,7 +254,7 @@ bool queryProxyForFirmware() {
     }
     
     // Extract firmware metadata
-    if (!doc.containsKey("url") || !doc.containsKey("sha256")) {
+    if (!doc["url"].is<String>() || !doc["sha256"].is<String>()) {
         Serial.println("ERROR: Missing required fields in proxy response");
         lastError = "Invalid proxy response format";
         return false;
@@ -262,7 +262,7 @@ bool queryProxyForFirmware() {
     
     firmwareDownloadUrl = doc["url"].as<String>();
     firmwareSHA256 = doc["sha256"].as<String>();
-    firmwareSize = doc.containsKey("size") ? doc["size"].as<size_t>() : 0;
+    firmwareSize = doc["size"].is<size_t>() ? doc["size"].as<size_t>() : 0;
     
     Serial.println("Firmware metadata:");
     Serial.println("  Project: " + doc["project"].as<String>());
@@ -393,161 +393,92 @@ String scanNetworks() {
 }
 
 void handleRoot() {
-    String html = R"=====(
-<!DOCTYPE html>
-<html>
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ESP32 Setup</title>
-<style>
-body{font-family:Arial,sans-serif;margin:20px;background:#f5f5f5}
-.container{max-width:600px;margin:0 auto;background:white;padding:20px;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,0.1)}
-h1{color:#333;margin-top:0}
-h2{color:#666;font-size:18px;margin-top:30px;border-bottom:2px solid #ddd;padding-bottom:5px}
-button{background:#007bff;color:white;border:none;padding:10px 20px;border-radius:4px;cursor:pointer;font-size:14px;margin:5px}
-button:hover{background:#0056b3}
-button.danger{background:#dc3545}
-button.danger:hover{background:#c82333}
-input,select{width:100%;padding:10px;margin:5px 0;border:1px solid #ddd;border-radius:4px;box-sizing:border-box}
-label{display:block;margin-top:10px;color:#555;font-weight:bold}
-.network-item{padding:10px;margin:5px 0;background:#f8f9fa;border-radius:4px;display:flex;justify-content:space-between;align-items:center}
-.network-list{margin-top:10px}
-.status{padding:10px;margin:10px 0;border-radius:4px;display:none}
-.status.success{background:#d4edda;color:#155724;border:1px solid #c3e6cb;display:block}
-.status.error{background:#f8d7da;color:#721c24;border:1px solid #f5c6cb;display:block}
-.hidden{display:none}
-.device-info{background:#e7f3ff;padding:10px;border-radius:4px;margin-bottom:20px;font-size:12px;color:#004085}
-</style>
-</head>
-<body>
-<div class="container">
-<h1>ESP32 Web3E Setup</h1>
-<div class="device-info">
-<strong>Device Address:</strong> )=====" + deviceKey->getAddress().c_str() + R"=====(
-</div>
-<div id="status" class="status"></div>
-
-<h2>Connect to Wi-Fi</h2>
-<button onclick="scanNetworks()">Scan Networks</button>
-<div id="scan-results" class="hidden">
-<label>Select Network:</label>
-<select id="ssid-select" onchange="selectNetwork()"></select>
-<label>Password:</label>
-<input type="password" id="password" placeholder="Leave empty for open networks">
-<button onclick="saveNetwork()">Connect & Save</button>
-</div>
-
-<h2>Add Hidden Network</h2>
-<label>SSID:</label>
-<input type="text" id="hidden-ssid" placeholder="Network name">
-<label>Password:</label>
-<input type="password" id="hidden-password" placeholder="Leave empty for open networks">
-<button onclick="saveHiddenNetwork()">Add & Save</button>
-
-<h2>Saved Networks</h2>
-<button onclick="loadSavedNetworks()">Refresh List</button>
-<div id="saved-networks" class="network-list"></div>
-
-</div>
-
-<script>
-function showStatus(msg,isError){
-const s=document.getElementById('status');
-s.textContent=msg;
-s.className='status '+(isError?'error':'success');
-setTimeout(()=>{s.className='status'},5000);
-}
-
-function scanNetworks(){
-showStatus('Scanning...',false);
-fetch('/scan').then(r=>r.json()).then(data=>{
-const sel=document.getElementById('ssid-select');
-sel.innerHTML='<option value="">-- Select Network --</option>';
-data.forEach(net=>{
-const opt=document.createElement('option');
-opt.value=net.ssid;
-opt.textContent=net.ssid+' ('+(net.encrypted?'Secured':'Open')+') '+net.rssi+'dBm';
-opt.dataset.encrypted=net.encrypted;
-sel.appendChild(opt);
-});
-document.getElementById('scan-results').classList.remove('hidden');
-showStatus('Scan complete. '+data.length+' networks found.',false);
-}).catch(e=>showStatus('Scan failed',true));
-}
-
-function selectNetwork(){
-const sel=document.getElementById('ssid-select');
-const pwd=document.getElementById('password');
-if(sel.selectedOptions[0] && sel.selectedOptions[0].dataset.encrypted==='false'){
-pwd.value='';
-pwd.placeholder='Open network (no password)';
-}else{
-pwd.placeholder='Enter password';
-}
-}
-
-function saveNetwork(){
-const ssid=document.getElementById('ssid-select').value;
-const pwd=document.getElementById('password').value;
-if(!ssid){showStatus('Please select a network',true);return;}
-const formData=new FormData();
-formData.append('ssid',ssid);
-formData.append('password',pwd);
-showStatus('Saving and connecting...',false);
-fetch('/save',{method:'POST',body:formData})
-.then(r=>r.text())
-.then(msg=>{showStatus(msg,false);setTimeout(()=>location.reload(),2000);})
-.catch(e=>showStatus('Failed to save',true));
-}
-
-function saveHiddenNetwork(){
-const ssid=document.getElementById('hidden-ssid').value.trim();
-const pwd=document.getElementById('hidden-password').value;
-if(!ssid){showStatus('Please enter SSID',true);return;}
-const formData=new FormData();
-formData.append('ssid',ssid);
-formData.append('password',pwd);
-showStatus('Saving...',false);
-fetch('/save',{method:'POST',body:formData})
-.then(r=>r.text())
-.then(msg=>{showStatus(msg,false);document.getElementById('hidden-ssid').value='';document.getElementById('hidden-password').value='';})
-.catch(e=>showStatus('Failed to save',true));
-}
-
-function loadSavedNetworks(){
-fetch('/list').then(r=>r.json()).then(data=>{
-const div=document.getElementById('saved-networks');
-if(data.length===0){
-div.innerHTML='<p>No saved networks</p>';
-return;
-}
-div.innerHTML='';
-data.forEach((net,idx)=>{
-const item=document.createElement('div');
-item.className='network-item';
-item.innerHTML='<span><strong>'+net.ssid+'</strong> '+(net.pwLen>0?'(Secured)':'(Open)')+'</span>'+
-'<button class="danger" onclick="removeNetwork('+idx+')">Remove</button>';
-div.appendChild(item);
-});
-}).catch(e=>showStatus('Failed to load saved networks',true));
-}
-
-function removeNetwork(idx){
-if(!confirm('Remove this network?'))return;
-const formData=new FormData();
-formData.append('index',idx);
-fetch('/remove',{method:'POST',body:formData})
-.then(r=>r.text())
-.then(msg=>{showStatus(msg,false);loadSavedNetworks();})
-.catch(e=>showStatus('Failed to remove',true));
-}
-
-loadSavedNetworks();
-</script>
-</body>
-</html>
-)=====";
+    String deviceAddr = deviceKey->getAddress().c_str();
+    
+    String html = "<!DOCTYPE html><html><head><meta charset=\"UTF-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+        "<title>ESP32 Setup</title><style>"
+        "body{font-family:Arial,sans-serif;margin:20px;background:#f5f5f5}"
+        ".container{max-width:600px;margin:0 auto;background:white;padding:20px;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,0.1)}"
+        "h1{color:#333;margin-top:0}"
+        "h2{color:#666;font-size:18px;margin-top:30px;border-bottom:2px solid #ddd;padding-bottom:5px}"
+        "button{background:#007bff;color:white;border:none;padding:10px 20px;border-radius:4px;cursor:pointer;font-size:14px;margin:5px}"
+        "button:hover{background:#0056b3}"
+        "button.danger{background:#dc3545}"
+        "button.danger:hover{background:#c82333}"
+        "input,select{width:100%;padding:10px;margin:5px 0;border:1px solid #ddd;border-radius:4px;box-sizing:border-box}"
+        "label{display:block;margin-top:10px;color:#555;font-weight:bold}"
+        ".network-item{padding:10px;margin:5px 0;background:#f8f9fa;border-radius:4px;display:flex;justify-content:space-between;align-items:center}"
+        ".network-list{margin-top:10px}"
+        ".status{padding:10px;margin:10px 0;border-radius:4px;display:none}"
+        ".status.success{background:#d4edda;color:#155724;border:1px solid #c3e6cb;display:block}"
+        ".status.error{background:#f8d7da;color:#721c24;border:1px solid #f5c6cb;display:block}"
+        ".hidden{display:none}"
+        ".device-info{background:#e7f3ff;padding:10px;border-radius:4px;margin-bottom:20px;font-size:12px;color:#004085}"
+        "</style></head><body><div class=\"container\">"
+        "<h1>ESP32 Web3E Setup</h1>"
+        "<div class=\"device-info\"><strong>Device Address:</strong> " + deviceAddr + "</div>"
+        "<div id=\"status\" class=\"status\"></div>"
+        "<h2>Connect to Wi-Fi</h2><button onclick=\"scanNetworks()\">Scan Networks</button>"
+        "<div id=\"scan-results\" class=\"hidden\">"
+        "<label>Select Network:</label><select id=\"ssid-select\" onchange=\"selectNetwork()\"></select>"
+        "<label>Password:</label><input type=\"password\" id=\"password\" placeholder=\"Leave empty for open networks\">"
+        "<button onclick=\"saveNetwork()\">Connect & Save</button></div>"
+        "<h2>Add Hidden Network</h2><label>SSID:</label>"
+        "<input type=\"text\" id=\"hidden-ssid\" placeholder=\"Network name\">"
+        "<label>Password:</label><input type=\"password\" id=\"hidden-password\" placeholder=\"Leave empty for open networks\">"
+        "<button onclick=\"saveHiddenNetwork()\">Add & Save</button>"
+        "<h2>Saved Networks</h2><button onclick=\"loadSavedNetworks()\">Refresh List</button>"
+        "<div id=\"saved-networks\" class=\"network-list\"></div></div><script>"
+        "function showStatus(msg,isError){"
+        "const s=document.getElementById('status');s.textContent=msg;"
+        "s.className='status '+(isError?'error':'success');"
+        "setTimeout(()=>{s.className='status'},5000);}"
+        "function scanNetworks(){showStatus('Scanning...',false);"
+        "fetch('/scan').then(r=>r.json()).then(data=>{"
+        "const sel=document.getElementById('ssid-select');"
+        "sel.innerHTML='<option value=\"\">-- Select Network --</option>';"
+        "data.forEach(net=>{const opt=document.createElement('option');"
+        "opt.value=net.ssid;opt.textContent=net.ssid+' ('+(net.encrypted?'Secured':'Open')+') '+net.rssi+'dBm';"
+        "opt.dataset.encrypted=net.encrypted;sel.appendChild(opt);});"
+        "document.getElementById('scan-results').classList.remove('hidden');"
+        "showStatus('Scan complete. '+data.length+' networks found.',false);"
+        "}).catch(e=>showStatus('Scan failed',true));}"
+        "function selectNetwork(){const sel=document.getElementById('ssid-select');"
+        "const pwd=document.getElementById('password');"
+        "if(sel.selectedOptions[0]&&sel.selectedOptions[0].dataset.encrypted==='false'){"
+        "pwd.value='';pwd.placeholder='Open network (no password)';"
+        "}else{pwd.placeholder='Enter password';}}"
+        "function saveNetwork(){const ssid=document.getElementById('ssid-select').value;"
+        "const pwd=document.getElementById('password').value;"
+        "if(!ssid){showStatus('Please select a network',true);return;}"
+        "const formData=new FormData();formData.append('ssid',ssid);formData.append('password',pwd);"
+        "showStatus('Saving and connecting...',false);"
+        "fetch('/save',{method:'POST',body:formData})"
+        ".then(r=>r.text()).then(msg=>{showStatus(msg,false);setTimeout(()=>location.reload(),2000);})"
+        ".catch(e=>showStatus('Failed to save',true));}"
+        "function saveHiddenNetwork(){const ssid=document.getElementById('hidden-ssid').value.trim();"
+        "const pwd=document.getElementById('hidden-password').value;"
+        "if(!ssid){showStatus('Please enter SSID',true);return;}"
+        "const formData=new FormData();formData.append('ssid',ssid);formData.append('password',pwd);"
+        "showStatus('Saving...',false);fetch('/save',{method:'POST',body:formData})"
+        ".then(r=>r.text()).then(msg=>{showStatus(msg,false);"
+        "document.getElementById('hidden-ssid').value='';document.getElementById('hidden-password').value='';})"
+        ".catch(e=>showStatus('Failed to save',true));}"
+        "function loadSavedNetworks(){fetch('/list').then(r=>r.json()).then(data=>{"
+        "const div=document.getElementById('saved-networks');"
+        "if(data.length===0){div.innerHTML='<p>No saved networks</p>';return;}"
+        "div.innerHTML='';data.forEach((net,idx)=>{"
+        "const item=document.createElement('div');item.className='network-item';"
+        "item.innerHTML='<span><strong>'+net.ssid+'</strong> '+(net.pwLen>0?'(Secured)':'(Open)')+'</span>'"
+        "+'<button class=\"danger\" onclick=\"removeNetwork('+idx+')\">Remove</button>';"
+        "div.appendChild(item);});}).catch(e=>showStatus('Failed to load saved networks',true));}"
+        "function removeNetwork(idx){if(!confirm('Remove this network?'))return;"
+        "const formData=new FormData();formData.append('index',idx);"
+        "fetch('/remove',{method:'POST',body:formData})"
+        ".then(r=>r.text()).then(msg=>{showStatus(msg,false);loadSavedNetworks();})"
+        ".catch(e=>showStatus('Failed to remove',true));}"
+        "loadSavedNetworks();</script></body></html>";
     
     webServer.send(200, "text/html", html);
 }

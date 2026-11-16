@@ -1,5 +1,6 @@
 #include <unity.h>
 #include <string.h>
+#include <cstdio>
 #include "../lib/WifiStore/WifiStore.h"
 
 // Mock EEPROM for testing
