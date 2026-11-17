@@ -1,5 +1,5 @@
-#ifndef WIFISTORE_H
-#define WIFISTORE_H
+#ifndef SETUPWIFISTORE_H
+#define SETUPWIFISTORE_H
 
 #include <stdint.h>
 #include <string.h>
@@ -32,18 +32,31 @@
 // Calculate required EEPROM size
 // Header + max networks * (1+32+1+64) + terminator + CRC
 #define WIFI_MAX_STORAGE_SIZE (WIFI_HEADER_SIZE + (MAX_WIFI_NETWORKS * (1 + MAX_SSID_LENGTH + 1 + MAX_PASSWORD_LENGTH)) + WIFI_TERMINATOR_SIZE + WIFI_CRC_SIZE)
-#define TOTAL_EEPROM_SIZE (WIFI_EEPROM_OFFSET + WIFI_MAX_STORAGE_SIZE)
 
+// Use WEB3E_EEPROM_SIZE if available (from Web3E master), otherwise calculate
+#ifdef WEB3E_EEPROM_SIZE
+#define TOTAL_EEPROM_SIZE WEB3E_EEPROM_SIZE
+#else
+#define TOTAL_EEPROM_SIZE (WIFI_EEPROM_OFFSET + WIFI_MAX_STORAGE_SIZE)
+#endif
+
+// Forward declare WifiCredential if not already defined by Web3E
+#ifndef WIFICREDENTIAL_DEFINED
+#define WIFICREDENTIAL_DEFINED
 struct WifiCredential {
     char ssid[MAX_SSID_LENGTH + 1];
     char password[MAX_PASSWORD_LENGTH + 1];
     uint8_t ssidLen;
     uint8_t pwLen;
 };
+#endif
 
-class WifiStore {
+// SetupWifiStore: Extended WifiStore with write operations for provisioning
+// Uses the same EEPROM layout as Web3E's WifiStore (offset 33+)
+// Byte-compatible with Web3E's read-only WifiStore
+class SetupWifiStore {
 public:
-    WifiStore();
+    SetupWifiStore();
     
     // Initialize and read stored networks
     bool begin();
@@ -87,4 +100,4 @@ private:
     int readStoredNetworks(WifiCredential* credentials, int maxCount, bool validate);
 };
 
-#endif // WIFISTORE_H
+#endif // SETUPWIFISTORE_H

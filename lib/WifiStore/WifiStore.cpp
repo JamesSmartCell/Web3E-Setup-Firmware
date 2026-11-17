@@ -44,9 +44,9 @@ static const uint32_t crc32_table[256] = {
     0xB3667A2E, 0xC4614AB8, 0x5D681B02, 0x2A6F2B94, 0xB40BBE37, 0xC30C8EA1, 0x5A05DF1B, 0x2D02EF8D
 };
 
-WifiStore::WifiStore() : isInitialized(false) {}
+SetupWifiStore::SetupWifiStore() : isInitialized(false) {}
 
-bool WifiStore::begin() {
+bool SetupWifiStore::begin() {
 #ifndef NATIVE_TEST
     if (!EEPROM.begin(TOTAL_EEPROM_SIZE)) {
         return false;
@@ -67,7 +67,7 @@ bool WifiStore::begin() {
     return true;
 }
 
-uint32_t WifiStore::calculateCRC32(const uint8_t* data, size_t length) {
+uint32_t SetupWifiStore::calculateCRC32(const uint8_t* data, size_t length) {
     uint32_t crc = 0xFFFFFFFF;
     for (size_t i = 0; i < length; i++) {
         crc = crc32_table[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
@@ -75,7 +75,7 @@ uint32_t WifiStore::calculateCRC32(const uint8_t* data, size_t length) {
     return ~crc;
 }
 
-uint8_t WifiStore::eepromRead(int address) {
+uint8_t SetupWifiStore::eepromRead(int address) {
 #ifndef NATIVE_TEST
     return EEPROM.read(address);
 #else
@@ -83,13 +83,13 @@ uint8_t WifiStore::eepromRead(int address) {
 #endif
 }
 
-void WifiStore::eepromWrite(int address, uint8_t value) {
+void SetupWifiStore::eepromWrite(int address, uint8_t value) {
 #ifndef NATIVE_TEST
     EEPROM.write(address, value);
 #endif
 }
 
-bool WifiStore::eepromCommit() {
+bool SetupWifiStore::eepromCommit() {
 #ifndef NATIVE_TEST
     return EEPROM.commit();
 #else
@@ -97,7 +97,7 @@ bool WifiStore::eepromCommit() {
 #endif
 }
 
-bool WifiStore::isValid() {
+bool SetupWifiStore::isValid() {
     if (!isInitialized) return false;
     
     // Check magic
@@ -168,7 +168,7 @@ bool WifiStore::isValid() {
     return calculatedCRC == storedCRC;
 }
 
-int WifiStore::readNetworks(WifiCredential* credentials, int maxCount) {
+int SetupWifiStore::readNetworks(WifiCredential* credentials, int maxCount) {
 #ifndef NATIVE_TEST
     // Guard against EEPROM truncation
     if (EEPROM.length() < TOTAL_EEPROM_SIZE) {
@@ -179,7 +179,7 @@ int WifiStore::readNetworks(WifiCredential* credentials, int maxCount) {
     return readStoredNetworks(credentials, maxCount, true);
 }
 
-int WifiStore::readStoredNetworks(WifiCredential* credentials, int maxCount, bool validate) {
+int SetupWifiStore::readStoredNetworks(WifiCredential* credentials, int maxCount, bool validate) {
     if (!isInitialized) return 0;
     if (validate && !isValid()) return 0;
     
@@ -218,7 +218,7 @@ int WifiStore::readStoredNetworks(WifiCredential* credentials, int maxCount, boo
     return count;
 }
 
-bool WifiStore::writeNetworks(const WifiCredential* credentials, int count) {
+bool SetupWifiStore::writeNetworks(const WifiCredential* credentials, int count) {
     if (!isInitialized) return false;
     if (count > MAX_WIFI_NETWORKS) return false;
     
@@ -261,7 +261,7 @@ bool WifiStore::writeNetworks(const WifiCredential* credentials, int count) {
     return eepromCommit();
 }
 
-bool WifiStore::writeHeader() {
+bool SetupWifiStore::writeHeader() {
     for (int i = 0; i < WIFI_MAGIC_SIZE; i++) {
         eepromWrite(WIFI_EEPROM_OFFSET + i, WIFI_MAGIC[i]);
     }
@@ -269,13 +269,13 @@ bool WifiStore::writeHeader() {
     return true;
 }
 
-bool WifiStore::writeTerminator(int offset) {
+bool SetupWifiStore::writeTerminator(int offset) {
     eepromWrite(offset, 0x00);
     eepromWrite(offset + 1, 0x00);
     return true;
 }
 
-bool WifiStore::writeCRC(int dataEndOffset) {
+bool SetupWifiStore::writeCRC(int dataEndOffset) {
     // Calculate CRC from start of WiFi data to terminator
     int dataLen = dataEndOffset - WIFI_EEPROM_OFFSET;
     uint8_t buffer[WIFI_MAX_STORAGE_SIZE];
@@ -294,7 +294,7 @@ bool WifiStore::writeCRC(int dataEndOffset) {
     return true;
 }
 
-bool WifiStore::appendNetwork(const char* ssid, const char* password) {
+bool SetupWifiStore::appendNetwork(const char* ssid, const char* password) {
     if (!isInitialized) return false;
     
     WifiCredential credentials[MAX_WIFI_NETWORKS];
@@ -319,7 +319,7 @@ bool WifiStore::appendNetwork(const char* ssid, const char* password) {
     return writeNetworks(credentials, count + 1);
 }
 
-bool WifiStore::removeNetwork(int index) {
+bool SetupWifiStore::removeNetwork(int index) {
     if (!isInitialized) return false;
     
     WifiCredential credentials[MAX_WIFI_NETWORKS];
@@ -335,12 +335,12 @@ bool WifiStore::removeNetwork(int index) {
     return writeNetworks(credentials, count - 1);
 }
 
-bool WifiStore::clearNetworks() {
+bool SetupWifiStore::clearNetworks() {
     if (!isInitialized) return false;
     return writeNetworks(NULL, 0);
 }
 
-int WifiStore::getNetworkCount() {
+int SetupWifiStore::getNetworkCount() {
     if (!isInitialized) return 0;
     if (!isValid()) return 0;
     

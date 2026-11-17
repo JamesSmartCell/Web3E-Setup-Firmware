@@ -46,7 +46,7 @@
 #define OTA_RETRY_DELAY_MS 5000
 
 // Global objects
-WifiStore wifiStore;
+SetupWifiStore wifiStore;
 DNSServer dnsServer;
 WebServer webServer(WEB_SERVER_PORT);
 KeyID* deviceKey = nullptr;
@@ -58,6 +58,9 @@ String lastError = "";
 String firmwareDownloadUrl = "";
 String firmwareSHA256 = "";
 size_t firmwareSize = 0;
+unsigned long lastScanTime = 0;
+bool scanInProgress = false;
+int lastScanCount = 0;
 
 // Forward declarations
 void setupAccessPoint();
@@ -66,14 +69,18 @@ void initializeDeviceKey();
 bool connectToStoredNetworks();
 bool queryProxyForFirmware();
 bool downloadAndFlashFirmware();
+void startWifiScan();
+void checkScanProgress();
 String scanNetworks();
 void handleRoot();
 void handleScan();
 void handleSave();
 void handleList();
 void handleRemove();
+void handleDone();
 void handleNotFound();
 bool verifyFirmwareSHA256(const String& sha256);
+bool downloadAndVerifyFirmware(const String& url, const String& expectedSHA256);
 
 #ifdef TEST_PROVISION
 void runTestProvisioning();
@@ -144,12 +151,19 @@ void setup() {
     Serial.println("Starting captive portal for Wi-Fi configuration...");
     setupAccessPoint();
     setupWebServer();
+    
+    // Start initial Wi-Fi scan
+    Serial.println("Starting initial Wi-Fi scan...");
+    startWifiScan();
 #endif
 }
 
 void loop() {
     dnsServer.processNextRequest();
     webServer.handleClient();
+    
+    // Check scan progress and restart periodically
+    checkScanProgress();
     
     // Check if Wi-Fi was configured and we should retry OTA
     if (wifiConnected && firmwareDownloadUrl.length() > 0) {
@@ -302,64 +316,162 @@ bool queryProxyForFirmware() {
     return true;
 }
 
+bool downloadAndVerifyFirmware(const String& url, const String& expectedSHA256) {
+    Serial.println("\n=== Starting OTA Download with SHA-256 Verification ===");
+    Serial.println("Downloading from: " + url);
+    if (expectedSHA256.length() == 64) {
+        Serial.println("Expected SHA-256: " + expectedSHA256);
+    } else {
+        Serial.println("WARNING: No SHA-256 provided, skipping verification");
+    }
+    
+    WiFiClientSecure client;
+    client.setInsecure();
+    
+    HTTPClient http;
+    http.begin(client, url);
+    http.setTimeout(30000);
+    
+    int httpCode = http.GET();
+    if (httpCode != 200) {
+        Serial.printf("ERROR: HTTP GET failed with code %d\n", httpCode);
+        lastError = "Download failed: HTTP " + String(httpCode);
+        http.end();
+        return false;
+    }
+    
+    int contentLength = http.getSize();
+    if (contentLength <= 0) {
+        Serial.println("ERROR: Invalid content length");
+        lastError = "Invalid content length";
+        http.end();
+        return false;
+    }
+    
+    Serial.printf("Content-Length: %d bytes\n", contentLength);
+    
+    if (firmwareSize > 0 && contentLength != (int)firmwareSize) {
+        Serial.printf("WARNING: Size mismatch. Expected: %zu, Got: %d\n", firmwareSize, contentLength);
+    }
+    
+    // Initialize Update
+    if (!Update.begin(contentLength)) {
+        Serial.println("ERROR: Not enough space for OTA update");
+        lastError = "Not enough space";
+        http.end();
+        return false;
+    }
+    
+    // Initialize SHA-256 context
+    mbedtls_sha256_context sha256_ctx;
+    mbedtls_sha256_init(&sha256_ctx);
+    mbedtls_sha256_starts(&sha256_ctx, 0);
+    
+    WiFiClient* stream = http.getStreamPtr();
+    uint8_t buffer[512];
+    int written = 0;
+    int lastProgress = -1;
+    
+    Serial.println("Downloading and computing SHA-256...");
+    
+    while (http.connected() && written < contentLength) {
+        size_t available = stream->available();
+        if (available) {
+            int bytesToRead = (available > sizeof(buffer)) ? sizeof(buffer) : available;
+            int bytesRead = stream->readBytes(buffer, bytesToRead);
+            
+            if (bytesRead > 0) {
+                // Write to OTA partition
+                if (Update.write(buffer, bytesRead) != bytesRead) {
+                    Serial.println("ERROR: Update.write() failed");
+                    lastError = "Write failed";
+                    Update.abort();
+                    mbedtls_sha256_free(&sha256_ctx);
+                    http.end();
+                    return false;
+                }
+                
+                // Update SHA-256 hash
+                mbedtls_sha256_update(&sha256_ctx, buffer, bytesRead);
+                
+                written += bytesRead;
+                
+                int progress = (written * 100) / contentLength;
+                if (progress != lastProgress && progress % 10 == 0) {
+                    Serial.printf("Progress: %d%% (%d/%d bytes)\n", progress, written, contentLength);
+                    lastProgress = progress;
+                }
+            }
+        } else {
+            delay(10);
+        }
+    }
+    
+    http.end();
+    
+    if (written != contentLength) {
+        Serial.printf("ERROR: Incomplete download. Expected: %d, Got: %d\n", contentLength, written);
+        lastError = "Incomplete download";
+        Update.abort();
+        mbedtls_sha256_free(&sha256_ctx);
+        return false;
+    }
+    
+    // Finalize SHA-256
+    uint8_t computedHash[32];
+    mbedtls_sha256_finish(&sha256_ctx, computedHash);
+    mbedtls_sha256_free(&sha256_ctx);
+    
+    // Convert to hex string
+    char computedHashHex[65];
+    for (int i = 0; i < 32; i++) {
+        sprintf(&computedHashHex[i * 2], "%02x", computedHash[i]);
+    }
+    computedHashHex[64] = '\0';
+    
+    Serial.println("Download complete!");
+    Serial.print("Computed SHA-256: ");
+    Serial.println(computedHashHex);
+    
+    // Verify SHA-256 if expected hash provided
+    if (expectedSHA256.length() == 64) {
+        String computedStr = String(computedHashHex);
+        computedStr.toLowerCase();
+        String expectedStr = expectedSHA256;
+        expectedStr.toLowerCase();
+        
+        if (computedStr != expectedStr) {
+            Serial.println("ERROR: SHA-256 MISMATCH!");
+            Serial.println("Expected: " + expectedStr);
+            Serial.println("Computed: " + computedStr);
+            lastError = "SHA-256 verification failed";
+            Update.abort();
+            return false;
+        }
+        
+        Serial.println("SHA-256 verification: PASSED");
+    } else {
+        Serial.println("WARNING: SHA-256 verification skipped (no expected hash)");
+    }
+    
+    // Commit the update
+    if (!Update.end(true)) {
+        Serial.println("ERROR: Update.end() failed");
+        lastError = "Update commit failed";
+        return false;
+    }
+    
+    Serial.println("Update verified and flashed successfully!");
+    return true;
+}
+
 bool downloadAndFlashFirmware() {
     if (firmwareDownloadUrl.length() == 0) {
         Serial.println("ERROR: No firmware URL available");
         return false;
     }
     
-    Serial.println("\n=== Starting OTA Update ===");
-    Serial.println("Downloading from: " + firmwareDownloadUrl);
-    
-    // Configure HTTPUpdate
-    httpUpdate.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-    httpUpdate.rebootOnUpdate(false);
-    
-    // Set up progress callback
-    httpUpdate.onProgress([](int current, int total) {
-        if (total > 0) {
-            Serial.printf("Progress: %d%% (%d/%d bytes)\n", (current * 100) / total, current, total);
-        }
-    });
-    
-    WiFiClientSecure client;
-    client.setInsecure(); // Web3E uses untrusted HTTPS mode
-    
-    // Perform update
-    t_httpUpdate_return ret = httpUpdate.update(client, firmwareDownloadUrl);
-    
-    switch (ret) {
-        case HTTP_UPDATE_FAILED:
-            Serial.printf("ERROR: OTA failed - %s\n", httpUpdate.getLastErrorString().c_str());
-            lastError = "OTA failed: " + httpUpdate.getLastErrorString();
-            return false;
-            
-        case HTTP_UPDATE_NO_UPDATES:
-            Serial.println("No update available");
-            return false;
-            
-        case HTTP_UPDATE_OK:
-            Serial.println("OTA download complete, verifying...");
-            
-            // Verify SHA256 if provided
-            if (firmwareSHA256.length() == 64) {
-                Serial.println("Note: SHA256 verification happens during HTTPUpdate");
-                Serial.println("For post-download verification, implement partition reading");
-                // TODO: Read OTA partition and verify hash
-                // For now, trust HTTPUpdate's internal verification
-            }
-            
-            // Verify size if provided
-            if (firmwareSize > 0) {
-                Serial.printf("Expected size: %zu bytes\n", firmwareSize);
-                // Size is verified during download by HTTPUpdate
-            }
-            
-            Serial.println("Update verified and flashed successfully!");
-            return true;
-    }
-    
-    return false;
+    return downloadAndVerifyFirmware(firmwareDownloadUrl, firmwareSHA256);
 }
 
 void setupAccessPoint() {
@@ -398,26 +510,85 @@ void setupWebServer() {
     webServer.on("/save", HTTP_POST, handleSave);
     webServer.on("/list", handleList);
     webServer.on("/remove", HTTP_POST, handleRemove);
+    webServer.on("/done", HTTP_POST, handleDone);
     webServer.onNotFound(handleNotFound);
     
     webServer.begin();
     Serial.println("Web server started on port 80");
 }
 
-String scanNetworks() {
-    Serial.println("Scanning for Wi-Fi networks...");
-    int n = WiFi.scanNetworks();
-    
-    String json = "[";
-    for (int i = 0; i < n; i++) {
-        if (i > 0) json += ",";
-        json += "{\"ssid\":\"" + WiFi.SSID(i) + "\",";
-        json += "\"rssi\":" + String(WiFi.RSSI(i)) + ",";
-        json += "\"encrypted\":" + String(WiFi.encryptionType(i) != WIFI_AUTH_OPEN ? "true" : "false") + "}";
+void startWifiScan() {
+    if (!scanInProgress) {
+        WiFi.mode(WIFI_AP_STA);
+        WiFi.scanNetworks(true);
+        scanInProgress = true;
+        lastScanTime = millis();
+        Serial.println("Wi-Fi scan started (async)");
     }
-    json += "]";
+}
+
+void checkScanProgress() {
+    if (scanInProgress) {
+        int n = WiFi.scanComplete();
+        if (n >= 0) {
+            lastScanCount = n;
+            scanInProgress = false;
+            Serial.printf("Wi-Fi scan complete: %d networks found\n", n);
+        } else if (n == WIFI_SCAN_FAILED) {
+            scanInProgress = false;
+            Serial.println("Wi-Fi scan failed");
+        }
+    }
     
-    return json;
+    if (!scanInProgress && (millis() - lastScanTime > 12000)) {
+        startWifiScan();
+    }
+}
+
+String scanNetworks() {
+    int n = WiFi.scanComplete();
+    
+    if (n == WIFI_SCAN_RUNNING) {
+        return "{\"scanning\":true,\"networks\":[]}";
+    } else if (n == WIFI_SCAN_FAILED) {
+        return "{\"scanning\":false,\"networks\":[]}";
+    } else if (n >= 0) {
+        String json = "{\"scanning\":false,\"networks\":[";
+        
+        bool seen[n];
+        for (int i = 0; i < n; i++) seen[i] = false;
+        
+        for (int i = 0; i < n; i++) {
+            if (seen[i]) continue;
+            
+            String ssid = WiFi.SSID(i);
+            int bestRSSI = WiFi.RSSI(i);
+            int bestIdx = i;
+            bool encrypted = (WiFi.encryptionType(i) != WIFI_AUTH_OPEN);
+            
+            for (int j = i + 1; j < n; j++) {
+                if (!seen[j] && WiFi.SSID(j) == ssid) {
+                    seen[j] = true;
+                    if (WiFi.RSSI(j) > bestRSSI) {
+                        bestRSSI = WiFi.RSSI(j);
+                        bestIdx = j;
+                    }
+                }
+            }
+            
+            seen[bestIdx] = true;
+            
+            if (i > 0) json += ",";
+            json += "{\"ssid\":\"" + ssid + "\",";
+            json += "\"rssi\":" + String(bestRSSI) + ",";
+            json += "\"encrypted\":" + String(encrypted ? "true" : "false") + "}";
+        }
+        
+        json += "]}";
+        return json;
+    }
+    
+    return "{\"scanning\":false,\"networks\":[]}";
 }
 
 void handleRoot() {
@@ -434,79 +605,107 @@ void handleRoot() {
         "button:hover{background:#0056b3}"
         "button.danger{background:#dc3545}"
         "button.danger:hover{background:#c82333}"
-        "input,select{width:100%;padding:10px;margin:5px 0;border:1px solid #ddd;border-radius:4px;box-sizing:border-box}"
+        "button.success{background:#28a745}"
+        "button.success:hover{background:#218838}"
+        "input,select{width:calc(100% - 40px);padding:10px;margin:5px 0;border:1px solid #ddd;border-radius:4px;box-sizing:border-box}"
+        ".pwd-wrapper{position:relative;display:block}"
+        ".pwd-wrapper input{width:calc(100% - 40px)}"
+        ".pwd-toggle{position:absolute;right:5px;top:50%;transform:translateY(-50%);background:#6c757d;color:white;border:none;padding:5px 10px;border-radius:3px;cursor:pointer;font-size:12px;font-weight:bold}"
+        ".pwd-toggle:hover{background:#5a6268}"
         "label{display:block;margin-top:10px;color:#555;font-weight:bold}"
-        ".network-item{padding:10px;margin:5px 0;background:#f8f9fa;border-radius:4px;display:flex;justify-content:space-between;align-items:center}"
+        ".network-item{padding:10px;margin:5px 0;background:#f8f9fa;border-radius:4px;cursor:pointer;display:flex;justify-content:space-between;align-items:center}"
+        ".network-item:hover{background:#e9ecef}"
+        ".network-item.selected{background:#d4edda;border:2px solid #28a745}"
         ".network-list{margin-top:10px}"
+        ".saved-item{padding:10px;margin:5px 0;background:#fff3cd;border-radius:4px;display:flex;justify-content:space-between;align-items:center}"
         ".status{padding:10px;margin:10px 0;border-radius:4px;display:none}"
         ".status.success{background:#d4edda;color:#155724;border:1px solid #c3e6cb;display:block}"
         ".status.error{background:#f8d7da;color:#721c24;border:1px solid #f5c6cb;display:block}"
+        ".status.info{background:#d1ecf1;color:#0c5460;border:1px solid #bee5eb;display:block}"
         ".hidden{display:none}"
         ".device-info{background:#e7f3ff;padding:10px;border-radius:4px;margin-bottom:20px;font-size:12px;color:#004085}"
+        ".scanning{color:#6c757d;font-style:italic;font-size:14px}"
         "</style></head><body><div class=\"container\">"
         "<h1>ESP32 Web3E Setup</h1>"
         "<div class=\"device-info\"><strong>Device Address:</strong> " + deviceAddr + "</div>"
         "<div id=\"status\" class=\"status\"></div>"
-        "<h2>Connect to Wi-Fi</h2><button onclick=\"scanNetworks()\">Scan Networks</button>"
-        "<div id=\"scan-results\" class=\"hidden\">"
-        "<label>Select Network:</label><select id=\"ssid-select\" onchange=\"selectNetwork()\"></select>"
-        "<label>Password:</label><input type=\"password\" id=\"password\" placeholder=\"Leave empty for open networks\">"
-        "<button onclick=\"saveNetwork()\">Connect & Save</button></div>"
+        "<h2>Available Networks <span id=\"scan-status\" class=\"scanning\">Scanning...</span></h2>"
+        "<div id=\"scan-results\" class=\"network-list\"></div>"
         "<h2>Add Hidden Network</h2><label>SSID:</label>"
         "<input type=\"text\" id=\"hidden-ssid\" placeholder=\"Network name\">"
-        "<label>Password:</label><input type=\"password\" id=\"hidden-password\" placeholder=\"Leave empty for open networks\">"
-        "<button onclick=\"saveHiddenNetwork()\">Add & Save</button>"
-        "<h2>Saved Networks</h2><button onclick=\"loadSavedNetworks()\">Refresh List</button>"
-        "<div id=\"saved-networks\" class=\"network-list\"></div></div><script>"
-        "function showStatus(msg,isError){"
+        "<label>Password:</label>"
+        "<div class=\"pwd-wrapper\"><input type=\"password\" id=\"hidden-password\" placeholder=\"Leave empty for open networks\">"
+        "<button class=\"pwd-toggle\" onclick=\"togglePassword('hidden-password')\">👁</button></div>"
+        "<button onclick=\"addHiddenNetwork()\">Add to List</button>"
+        "<h2>Saved Networks</h2>"
+        "<div id=\"saved-networks\" class=\"network-list\"></div>"
+        "<button class=\"success\" onclick=\"commitAndConnect()\" style=\"width:100%;margin-top:20px;font-size:16px\">Done - Connect & Update Firmware</button>"
+        "</div><script>"
+        "let selectedSSID='';"
+        "function showStatus(msg,type){"
         "const s=document.getElementById('status');s.textContent=msg;"
-        "s.className='status '+(isError?'error':'success');"
+        "s.className='status '+(type||'success');"
         "setTimeout(()=>{s.className='status'},5000);}"
-        "function scanNetworks(){showStatus('Scanning...',false);"
+        "function togglePassword(id){"
+        "const inp=document.getElementById(id);"
+        "inp.type=inp.type==='password'?'text':'password';}"
+        "function pollNetworks(){"
         "fetch('/scan').then(r=>r.json()).then(data=>{"
-        "const sel=document.getElementById('ssid-select');"
-        "sel.innerHTML='<option value=\"\">-- Select Network --</option>';"
-        "data.forEach(net=>{const opt=document.createElement('option');"
-        "opt.value=net.ssid;opt.textContent=net.ssid+' ('+(net.encrypted?'Secured':'Open')+') '+net.rssi+'dBm';"
-        "opt.dataset.encrypted=net.encrypted;sel.appendChild(opt);});"
-        "document.getElementById('scan-results').classList.remove('hidden');"
-        "showStatus('Scan complete. '+data.length+' networks found.',false);"
-        "}).catch(e=>showStatus('Scan failed',true));}"
-        "function selectNetwork(){const sel=document.getElementById('ssid-select');"
-        "const pwd=document.getElementById('password');"
-        "if(sel.selectedOptions[0]&&sel.selectedOptions[0].dataset.encrypted==='false'){"
-        "pwd.value='';pwd.placeholder='Open network (no password)';"
-        "}else{pwd.placeholder='Enter password';}}"
-        "function saveNetwork(){const ssid=document.getElementById('ssid-select').value;"
-        "const pwd=document.getElementById('password').value;"
-        "if(!ssid){showStatus('Please select a network',true);return;}"
-        "const formData=new FormData();formData.append('ssid',ssid);formData.append('password',pwd);"
-        "showStatus('Saving and connecting...',false);"
-        "fetch('/save',{method:'POST',body:formData})"
-        ".then(r=>r.text()).then(msg=>{showStatus(msg,false);setTimeout(()=>location.reload(),2000);})"
-        ".catch(e=>showStatus('Failed to save',true));}"
-        "function saveHiddenNetwork(){const ssid=document.getElementById('hidden-ssid').value.trim();"
-        "const pwd=document.getElementById('hidden-password').value;"
-        "if(!ssid){showStatus('Please enter SSID',true);return;}"
-        "const formData=new FormData();formData.append('ssid',ssid);formData.append('password',pwd);"
-        "showStatus('Saving...',false);fetch('/save',{method:'POST',body:formData})"
-        ".then(r=>r.text()).then(msg=>{showStatus(msg,false);"
-        "document.getElementById('hidden-ssid').value='';document.getElementById('hidden-password').value='';})"
-        ".catch(e=>showStatus('Failed to save',true));}"
-        "function loadSavedNetworks(){fetch('/list').then(r=>r.json()).then(data=>{"
-        "const div=document.getElementById('saved-networks');"
-        "if(data.length===0){div.innerHTML='<p>No saved networks</p>';return;}"
-        "div.innerHTML='';data.forEach((net,idx)=>{"
+        "const status=document.getElementById('scan-status');"
+        "const div=document.getElementById('scan-results');"
+        "if(data.scanning){status.textContent='Scanning...';"
+        "return;}"
+        "status.textContent='';"
+        "if(!data.networks||data.networks.length===0){div.innerHTML='<p>No networks found</p>';return;}"
+        "div.innerHTML='';"
+        "data.networks.forEach(net=>{"
         "const item=document.createElement('div');item.className='network-item';"
-        "item.innerHTML='<span><strong>'+net.ssid+'</strong> '+(net.pwLen>0?'(Secured)':'(Open)')+'</span>'"
+        "const signal=net.rssi>-50?'▂▄▆█':(net.rssi>-70?'▂▄▆_':'▂▄__');"
+        "item.innerHTML='<span><strong>'+net.ssid+'</strong> '+signal+' '+(net.encrypted?'🔒':'')+'</span>';"
+        "item.onclick=()=>selectNetwork(net.ssid,net.encrypted);"
+        "div.appendChild(item);});}).catch(e=>console.log(e));}"
+        "function selectNetwork(ssid,encrypted){"
+        "selectedSSID=ssid;"
+        "const pwd=prompt('Enter password for: '+ssid+(encrypted?'':' (open network, leave empty)'));"
+        "if(pwd===null)return;"
+        "addNetwork(ssid,pwd);}"
+        "function addHiddenNetwork(){"
+        "const ssid=document.getElementById('hidden-ssid').value.trim();"
+        "const pwd=document.getElementById('hidden-password').value;"
+        "if(!ssid){showStatus('Please enter SSID','error');return;}"
+        "addNetwork(ssid,pwd);"
+        "document.getElementById('hidden-ssid').value='';"
+        "document.getElementById('hidden-password').value='';}"
+        "function addNetwork(ssid,pwd){"
+        "const formData=new FormData();formData.append('ssid',ssid);formData.append('password',pwd);"
+        "fetch('/save',{method:'POST',body:formData})"
+        ".then(r=>r.text()).then(msg=>{showStatus(msg,'success');loadSavedNetworks();})"
+        ".catch(e=>showStatus('Failed to add network','error'));}"
+        "function loadSavedNetworks(){"
+        "fetch('/list').then(r=>r.json()).then(data=>{"
+        "const div=document.getElementById('saved-networks');"
+        "if(data.length===0){div.innerHTML='<p>No networks saved yet. Add networks above, then click Done.</p>';return;}"
+        "div.innerHTML='';"
+        "data.forEach((net,idx)=>{"
+        "const item=document.createElement('div');item.className='saved-item';"
+        "item.innerHTML='<span><strong>'+net.ssid+'</strong> '+(net.pwLen>0?'🔒':'')+'</span>'"
         "+'<button class=\"danger\" onclick=\"removeNetwork('+idx+')\">Remove</button>';"
-        "div.appendChild(item);});}).catch(e=>showStatus('Failed to load saved networks',true));}"
+        "div.appendChild(item);});}).catch(e=>console.log(e));}"
         "function removeNetwork(idx){if(!confirm('Remove this network?'))return;"
         "const formData=new FormData();formData.append('index',idx);"
         "fetch('/remove',{method:'POST',body:formData})"
-        ".then(r=>r.text()).then(msg=>{showStatus(msg,false);loadSavedNetworks();})"
-        ".catch(e=>showStatus('Failed to remove',true));}"
-        "loadSavedNetworks();</script></body></html>";
+        ".then(r=>r.text()).then(msg=>{showStatus(msg,'success');loadSavedNetworks();})"
+        ".catch(e=>showStatus('Failed to remove','error'));}"
+        "function commitAndConnect(){"
+        "if(!confirm('Commit saved networks and start firmware update?'))return;"
+        "showStatus('Connecting to Wi-Fi and starting firmware update...','info');"
+        "fetch('/done',{method:'POST'})"
+        ".then(r=>r.text()).then(msg=>showStatus(msg,'success'))"
+        ".catch(e=>showStatus('Failed to start update','error'));}"
+        "pollNetworks();"
+        "setInterval(pollNetworks,3000);"
+        "loadSavedNetworks();"
+        "</script></body></html>";
     
     webServer.send(200, "text/html", html);
 }
@@ -525,43 +724,11 @@ void handleSave() {
     String password = webServer.hasArg("password") ? webServer.arg("password") : "";
     
     if (wifiStore.appendNetwork(ssid.c_str(), password.c_str())) {
-        Serial.println("Network saved: " + ssid);
-        
-        // Try to connect
-        WiFi.mode(WIFI_STA);
-        if (password.length() > 0) {
-            WiFi.begin(ssid.c_str(), password.c_str());
-        } else {
-            WiFi.begin(ssid.c_str());
-        }
-        
-        unsigned long startTime = millis();
-        bool connected = false;
-        while ((millis() - startTime) < WIFI_CONNECT_TIMEOUT_MS) {
-            if (WiFi.status() == WL_CONNECTED) {
-                connected = true;
-                break;
-            }
-            delay(500);
-        }
-        
-        if (connected) {
-            Serial.println("Connected! IP: " + WiFi.localIP().toString());
-            wifiConnected = true;
-            
-            // Query for firmware
-            if (queryProxyForFirmware()) {
-                webServer.send(200, "text/plain", "Connected! Starting firmware update...");
-            } else {
-                webServer.send(200, "text/plain", "Connected to Wi-Fi but firmware query failed: " + lastError);
-            }
-        } else {
-            Serial.println("Connection attempt failed, but network saved for later");
-            setupAccessPoint(); // Resume AP mode
-            webServer.send(200, "text/plain", "Network saved but connection failed. Try another network.");
-        }
+        Serial.println("Network added to list: " + ssid);
+        webServer.send(200, "text/plain", "Network added to list");
     } else {
-        webServer.send(500, "text/plain", "Failed to save network");
+        Serial.println("Failed to add network (storage full or error)");
+        webServer.send(500, "text/plain", "Failed to add network (storage may be full)");
     }
 }
 
@@ -589,14 +756,47 @@ void handleRemove() {
     int index = webServer.arg("index").toInt();
     
     if (wifiStore.removeNetwork(index)) {
+        Serial.printf("Network at index %d removed\n", index);
         webServer.send(200, "text/plain", "Network removed");
     } else {
         webServer.send(500, "text/plain", "Failed to remove network");
     }
 }
 
+void handleDone() {
+    Serial.println("\n=== User clicked Done - Attempting connection ===");
+    
+    int count = wifiStore.getNetworkCount();
+    if (count == 0) {
+        Serial.println("No networks saved");
+        webServer.send(400, "text/plain", "No networks saved. Add at least one network first.");
+        return;
+    }
+    
+    Serial.printf("Attempting to connect to %d saved network(s)...\n", count);
+    
+    webServer.send(200, "text/plain", "Connecting to saved networks...");
+    
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+    delay(100);
+    
+    if (connectToStoredNetworks()) {
+        Serial.println("Connected to Wi-Fi!");
+        wifiConnected = true;
+        
+        if (queryProxyForFirmware()) {
+            Serial.println("Firmware metadata retrieved, starting OTA update...");
+        } else {
+            Serial.println("Failed to query firmware metadata: " + lastError);
+        }
+    } else {
+        Serial.println("Failed to connect to any saved network");
+        setupAccessPoint();
+    }
+}
+
 void handleNotFound() {
-    // Redirect everything to root for captive portal
     webServer.sendHeader("Location", "/", true);
     webServer.send(302, "text/plain", "");
 }

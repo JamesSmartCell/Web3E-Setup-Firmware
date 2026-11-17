@@ -6,7 +6,7 @@
 // Mock EEPROM for testing
 static uint8_t mockEEPROM[TOTAL_EEPROM_SIZE];
 
-class TestableWifiStore : public WifiStore {
+class TestableWifiStore : public SetupWifiStore {
 protected:
     uint8_t eepromRead(int address) override {
         if (address >= 0 && address < TOTAL_EEPROM_SIZE) {
