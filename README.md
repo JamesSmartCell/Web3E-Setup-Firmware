@@ -45,9 +45,13 @@ For testing without the proxy, configure `FIRMWARE_URL` and optionally `FIRMWARE
 ## Per-Project Workflow
 
 1. **Configure the build:**
-   - Edit `platformio.ini` → `build_flags`
-   - Set `PROXY_BASE_URL` (e.g., `https://proxy.example.com`)
-   - Set `PROJECT_ID` (unique identifier for this project)
+   - Edit `platformio.ini` → `[env:esp32dev]`
+   - **CRITICAL: Set `board_build.partitions`** to match your target project firmware
+     - Default: `min_spiffs.csv` (1.9 MB OTA slots, recommended)
+     - If target firmware uses a different partition table, **you must use the same one here**
+     - OTA cannot change partition tables - mismatch = OTA failure
+   - Set `PROXY_BASE_URL` (e.g., `https://scriptproxy.percolate.one`)
+   - Set `PROJECT_ID` (unique identifier for this project, e.g., `garagedoor`)
    - Optionally customize `AP_SSID_PREFIX`, `AP_PASSWORD`, `MAX_WIFI_NETWORKS`
 
 2. **Build the setup firmware:**
@@ -208,8 +212,9 @@ Edit `platformio.ini` under `[env:esp32dev]` → `build_flags`:
 
 | Flag | Required | Default | Description |
 |------|----------|---------|-------------|
-| `PROXY_BASE_URL` | Yes* | - | SmartLayerProxy base URL (e.g., `https://proxy.example.com`) |
-| `PROJECT_ID` | Yes* | - | Unique project identifier for proxy API |
+| `board_build.partitions` | **CRITICAL** | `min_spiffs.csv` | **Partition table - MUST match target firmware!** |
+| `PROXY_BASE_URL` | Yes* | - | SmartLayerProxy base URL (e.g., `https://scriptproxy.percolate.one`) |
+| `PROJECT_ID` | Yes* | - | Unique project identifier for proxy API (e.g., `garagedoor`) |
 | `FIRMWARE_URL` | No | - | Direct firmware URL (overrides proxy, for testing) |
 | `FIRMWARE_SHA256` | No | - | Direct firmware SHA-256 (64 hex chars, only with `FIRMWARE_URL`) |
 | `AP_SSID_PREFIX` | No | `ESP32-Setup` | Access point SSID prefix (suffixed with `-XXXX` from MAC) |
@@ -217,6 +222,8 @@ Edit `platformio.ini` under `[env:esp32dev]` → `build_flags`:
 | `MAX_WIFI_NETWORKS` | No | 8 | Maximum networks to store in EEPROM |
 
 *Either `PROXY_BASE_URL` + `PROJECT_ID` OR `FIRMWARE_URL` must be configured.
+
+**⚠️ CRITICAL:** The `board_build.partitions` setting is not a build flag - it goes directly under `[env:esp32dev]` in `platformio.ini`, not inside `build_flags`. This setting determines the flash partition layout and **must match** your target project firmware's partition table.
 
 ## Captive Portal Features
 
@@ -234,21 +241,57 @@ The setup firmware provides a mobile-friendly captive portal with automatic Wi-F
 
 ## OTA Partition Scheme
 
-This firmware uses `default_ota.csv` (built into ESP-IDF):
+### CRITICAL: Partition Table Must Match Target Firmware
+
+**The setup firmware's partition table MUST match the target project firmware's partition table.**
+
+When you flash the setup firmware via USB, it **writes the partition table to the ESP32's flash**. OTA updates **cannot change** the partition table. If the setup firmware uses a smaller partition table than the target firmware needs, OTA will fail with "Not enough space" errors.
+
+### Default Configuration
+
+This firmware uses **`min_spiffs.csv`** by default (configured in `platformio.ini` → `board_build.partitions`):
 
 ```
 # Name,   Type, SubType, Offset,  Size
 nvs,      data, nvs,     0x9000,  0x5000
 otadata,  data, ota,     0xe000,  0x2000
-app0,     app,  ota_0,   0x10000, 0x140000
-app1,     app,  ota_1,   0x150000,0x140000
-spiffs,   data, spiffs,  0x290000,0x170000
+app0,     app,  ota_0,   0x10000, 0x1E0000
+app1,     app,  ota_1,   0x1F0000,0x1E0000
+spiffs,   data, spiffs,  0x3D0000,0x30000
 ```
 
-- **Two OTA slots:** `app0` and `app1` (1.25 MB each)
-- **No factory partition:** Recovery requires re-flashing setup firmware via USB
-- **NVS:** Stores Wi-Fi credentials (note: this firmware uses EEPROM abstraction, not NVS directly)
-- **SPIFFS:** Available for production firmware use (1.4 MB)
+- **Two OTA slots:** `app0` and `app1` (1.9 MB / ~1,966,080 bytes each)
+- **Minimal SPIFFS:** 192 KB (adjust if target firmware needs more storage)
+- **Supports large firmwares:** Up to ~1.9 MB (suitable for Web3/crypto projects)
+
+### Changing the Partition Table
+
+If your target project firmware uses a **different partition table**, you **must** update the setup firmware:
+
+1. Edit `platformio.ini` → `[env:esp32dev]` → `board_build.partitions`
+2. Set it to the **same partition CSV** as your target firmware
+3. Rebuild: `pio run -e esp32dev`
+4. **Re-flash via USB** to write the new partition table
+
+**Example:** If target firmware uses `default.csv` (1.25 MB slots):
+```ini
+board_build.partitions = default.csv
+```
+
+### Verifying Partition Size
+
+The setup firmware **checks partition size before OTA** and prints a clear error if there's a mismatch:
+
+```
+=== OTA PARTITION SIZE MISMATCH ===
+ERROR: Firmware too large for OTA partition!
+  Target firmware size: 1426768 bytes (1.36 MB)
+  Available OTA slot:   1310720 bytes (1.25 MB)
+
+CAUSE: Setup firmware partition table does not match target project firmware.
+FIX: Edit platformio.ini -> board_build.partitions, rebuild, and
+     re-flash setup firmware via USB.
+```
 
 When OTA updates are applied, the ESP32 bootloader alternates between `app0` and `app1`. The inactive slot is overwritten with the new firmware.
 

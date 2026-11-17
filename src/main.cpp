@@ -8,6 +8,7 @@
 #include <EEPROM.h>
 #include <ArduinoJson.h>
 #include <mbedtls/sha256.h>
+#include <esp_ota_ops.h>
 #include <Web3.h>
 #include <KeyID.h>
 #include "SetupWifiStore.h"
@@ -354,10 +355,36 @@ bool downloadAndVerifyFirmware(const String& url, const String& expectedSHA256) 
         Serial.printf("WARNING: Size mismatch. Expected: %zu, Got: %d\n", firmwareSize, contentLength);
     }
     
+    // Check available OTA partition size BEFORE attempting update
+    size_t updateSize = Update.size();
+    if (updateSize == 0) {
+        // Get the next OTA partition info
+        const esp_partition_t* partition = esp_ota_get_next_update_partition(NULL);
+        if (partition != NULL) {
+            updateSize = partition->size;
+        }
+    }
+    
+    if (updateSize > 0 && contentLength > (int)updateSize) {
+        Serial.println("\n=== OTA PARTITION SIZE MISMATCH ===");
+        Serial.printf("ERROR: Firmware too large for OTA partition!\n");
+        Serial.printf("  Target firmware size: %d bytes (%.2f MB)\n", contentLength, contentLength / 1048576.0);
+        Serial.printf("  Available OTA slot:   %zu bytes (%.2f MB)\n", updateSize, updateSize / 1048576.0);
+        Serial.println("\nCAUSE: Setup firmware partition table does not match target project firmware.");
+        Serial.println("FIX: The setup firmware must be built with the SAME partition table");
+        Serial.println("     as the target project firmware (e.g., min_spiffs.csv).");
+        Serial.println("     Edit platformio.ini -> board_build.partitions, rebuild, and");
+        Serial.println("     re-flash setup firmware via USB to write the correct partition table.");
+        Serial.println("=====================================\n");
+        lastError = "Firmware too large: partition table mismatch";
+        http.end();
+        return false;
+    }
+    
     // Initialize Update
     if (!Update.begin(contentLength)) {
-        Serial.println("ERROR: Not enough space for OTA update");
-        lastError = "Not enough space";
+        Serial.printf("ERROR: Update.begin() failed - %s\n", Update.errorString());
+        lastError = "Update.begin() failed";
         http.end();
         return false;
     }
