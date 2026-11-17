@@ -75,11 +75,32 @@ void handleRemove();
 void handleNotFound();
 bool verifyFirmwareSHA256(const String& sha256);
 
+#ifdef TEST_PROVISION
+void runTestProvisioning();
+#endif
+
 void setup() {
     Serial.begin(115200);
     delay(1000);
     
     Serial.println("\n\n=== ESP32 Web3E Setup Firmware ===");
+    
+#ifdef TEST_PROVISION
+    Serial.println("Mode: TEST_PROVISION (Hardware Test Harness)");
+    Serial.println("Initializing...");
+    
+    // Initialize EEPROM
+    if (!wifiStore.begin()) {
+        Serial.println("ERROR: Failed to initialize EEPROM");
+        ESP.restart();
+    }
+    
+    // Run test provisioning and halt
+    runTestProvisioning();
+    // Never returns to normal flow
+    return;
+#else
+    Serial.println("Mode: Production Setup");
     Serial.println("Initializing...");
     
     // Initialize EEPROM for WifiStore (KeyID initializes its own EEPROM region)
@@ -117,6 +138,7 @@ void setup() {
     Serial.println("Starting captive portal for Wi-Fi configuration...");
     setupAccessPoint();
     setupWebServer();
+#endif
 }
 
 void loop() {
@@ -572,3 +594,130 @@ void handleNotFound() {
     webServer.sendHeader("Location", "/", true);
     webServer.send(302, "text/plain", "");
 }
+
+#ifdef TEST_PROVISION
+void runTestProvisioning() {
+    Serial.println("\n=== Hardware Test Provisioning ===");
+    
+    // Check that test credentials are defined
+    #ifndef TEST_WIFI_SSID
+    #error "TEST_WIFI_SSID not defined - test_secrets.ini missing?"
+    #endif
+    #ifndef TEST_WIFI_PASS
+    #error "TEST_WIFI_PASS not defined - test_secrets.ini missing?"
+    #endif
+    
+    // Step 1: Ensure device key exists
+    Serial.println("Step 1: Initialize device key...");
+    web3 = new Web3(1);
+    deviceKey = new KeyID(web3);
+    
+    if (!deviceKey->hasRecoveredKey()) {
+        Serial.println("ERROR: Failed to initialize device key");
+        Serial.println("TEST:PROVISION_FAIL reason=key_init");
+        while(1) delay(1000);
+    }
+    
+    String deviceAddress = deviceKey->getAddress().c_str();
+    Serial.println("TEST:KEY_ADDR=" + deviceAddress);
+    
+    // Step 2: Write test Wi-Fi credentials to WifiStore
+    Serial.println("Step 2: Write test Wi-Fi credentials to EEPROM...");
+    
+    const char* testSSID = TEST_WIFI_SSID;
+    const char* testPass = TEST_WIFI_PASS;
+    
+    // Clear existing networks and write test network
+    if (!wifiStore.clearNetworks()) {
+        Serial.println("ERROR: Failed to clear existing networks");
+        Serial.println("TEST:WIFI_STORED=FAIL reason=clear_failed");
+        Serial.println("TEST:PROVISION_FAIL");
+        while(1) delay(1000);
+    }
+    
+    if (!wifiStore.appendNetwork(testSSID, testPass)) {
+        Serial.println("ERROR: Failed to write test network");
+        Serial.println("TEST:WIFI_STORED=FAIL reason=write_failed");
+        Serial.println("TEST:PROVISION_FAIL");
+        while(1) delay(1000);
+    }
+    
+    // Step 3: Verify by reading back
+    Serial.println("Step 3: Verify Wi-Fi credentials...");
+    
+    if (!wifiStore.isValid()) {
+        Serial.println("ERROR: WifiStore validation failed (CRC mismatch)");
+        Serial.println("TEST:WIFI_STORED=FAIL reason=crc_fail");
+        Serial.println("TEST:PROVISION_FAIL");
+        while(1) delay(1000);
+    }
+    
+    WifiCredential readBack[1];
+    int count = wifiStore.readNetworks(readBack, 1);
+    
+    if (count != 1) {
+        Serial.println("ERROR: Expected 1 network, got " + String(count));
+        Serial.println("TEST:WIFI_STORED=FAIL reason=count_mismatch");
+        Serial.println("TEST:PROVISION_FAIL");
+        while(1) delay(1000);
+    }
+    
+    if (strcmp(readBack[0].ssid, testSSID) != 0) {
+        Serial.println("ERROR: SSID mismatch after readback");
+        Serial.println("TEST:WIFI_STORED=FAIL reason=ssid_mismatch");
+        Serial.println("TEST:PROVISION_FAIL");
+        while(1) delay(1000);
+    }
+    
+    if (strcmp(readBack[0].password, testPass) != 0) {
+        Serial.println("ERROR: Password mismatch after readback");
+        Serial.println("TEST:WIFI_STORED=FAIL reason=password_mismatch");
+        Serial.println("TEST:PROVISION_FAIL");
+        while(1) delay(1000);
+    }
+    
+    Serial.println("TEST:WIFI_STORED=OK");
+    
+    // Step 4: Connect to Wi-Fi to prove credentials work
+    Serial.println("Step 4: Connect to test Wi-Fi network...");
+    
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(testSSID, testPass);
+    
+    unsigned long connectStart = millis();
+    unsigned long timeout = 30000; // 30 second timeout for test
+    
+    while (WiFi.status() != WL_CONNECTED) {
+        if (millis() - connectStart > timeout) {
+            Serial.println("ERROR: Wi-Fi connection timeout");
+            Serial.println("TEST:WIFI_CONNECT=FAIL reason=timeout");
+            Serial.println("TEST:PROVISION_FAIL");
+            while(1) delay(1000);
+        }
+        delay(500);
+        Serial.print(".");
+    }
+    Serial.println();
+    
+    unsigned long connectTime = millis() - connectStart;
+    String ipAddress = WiFi.localIP().toString();
+    
+    Serial.println("Connected to Wi-Fi!");
+    Serial.println("TEST:WIFI_CONNECT=OK ip=" + ipAddress + " ms=" + String(connectTime));
+    
+    // Step 5: Report success
+    Serial.println("\n=== Test Provisioning Complete ===");
+    Serial.println("Device Address: " + deviceAddress);
+    Serial.println("Wi-Fi SSID: " + String(testSSID));
+    Serial.println("Wi-Fi IP: " + ipAddress);
+    Serial.println("Connection Time: " + String(connectTime) + " ms");
+    Serial.println("\nTEST:PROVISION_DONE");
+    Serial.println("\nDevice is now provisioned and ready for production firmware flash.");
+    Serial.println("Idling... (no OTA in test mode)");
+    
+    // Step 6: Idle forever
+    while(1) {
+        delay(1000);
+    }
+}
+#endif

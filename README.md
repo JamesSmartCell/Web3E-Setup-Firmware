@@ -349,23 +349,205 @@ Validates:
 - **Verify** SmartLayerProxy returns valid JSON
 - **Test** direct URL with `FIRMWARE_URL` override
 
+## Hardware Test Provisioning
+
+The `test_provision` environment builds a special firmware variant for automated hardware test harnesses. This firmware auto-provisions devices with test credentials without user interaction.
+
+### Purpose
+
+Production manufacturing and testing environments can flash this firmware to:
+1. Generate or verify the device's Web3E private key
+2. Pre-load test Wi-Fi credentials into EEPROM
+3. Verify the device can connect to the test network
+4. Output machine-parseable test results over serial
+
+After provisioning completes, the production firmware is flashed over USB (no OTA in test mode).
+
+### Configuration
+
+1. **Create test secrets file:**
+   ```bash
+   cp test/test_secrets.ini.example test/test_secrets.ini
+   # Edit test/test_secrets.ini with your test network credentials
+   ```
+
+2. **Format of `test/test_secrets.ini`:**
+   ```ini
+   ; Test secrets for hardware provisioning
+   WIFI_SSID = YourTestNetwork
+   WIFI_PASS = YourTestPassword123
+   ```
+
+   - Simple `KEY = value` format (no `[section]` headers)
+   - Lines starting with `;` are comments
+   - This file is **gitignored** and must never be committed
+
+3. **Build test provisioning firmware:**
+   ```bash
+   pio run -e test_provision
+   ```
+
+   The pre-build script (`scripts/inject_test_secrets.py`) reads `test_secrets.ini` and injects the credentials as compile-time defines.
+
+4. **Flash to device:**
+   ```bash
+   pio run -e test_provision -t upload
+   ```
+
+### Serial Output (115200 baud)
+
+The firmware outputs machine-parseable lines for test harness automation:
+
+```
+=== ESP32 Web3E Setup Firmware ===
+Mode: TEST_PROVISION (Hardware Test Harness)
+Initializing...
+
+=== Hardware Test Provisioning ===
+Step 1: Initialize device key...
+TEST:KEY_ADDR=0x1234567890abcdef1234567890abcdef12345678
+Step 2: Write test Wi-Fi credentials to EEPROM...
+Step 3: Verify Wi-Fi credentials...
+TEST:WIFI_STORED=OK
+Step 4: Connect to test Wi-Fi network...
+...........
+Connected to Wi-Fi!
+TEST:WIFI_CONNECT=OK ip=192.168.1.100 ms=5234
+
+=== Test Provisioning Complete ===
+Device Address: 0x1234567890abcdef1234567890abcdef12345678
+Wi-Fi SSID: YourTestNetwork
+Wi-Fi IP: 192.168.1.100
+Connection Time: 5234 ms
+
+TEST:PROVISION_DONE
+
+Device is now provisioned and ready for production firmware flash.
+Idling... (no OTA in test mode)
+```
+
+### Parseable Test Lines
+
+| Line | Format | Meaning |
+|------|--------|---------|
+| `TEST:KEY_ADDR=0x...` | Device Ethereum address (40 hex chars) | Device key initialized |
+| `TEST:WIFI_STORED=OK` | Success | Credentials written and verified |
+| `TEST:WIFI_STORED=FAIL reason=...` | Failure | EEPROM write/verify failed |
+| `TEST:WIFI_CONNECT=OK ip=... ms=...` | Success with IP and connection time | Wi-Fi connected |
+| `TEST:WIFI_CONNECT=FAIL reason=...` | Failure | Wi-Fi connection failed |
+| `TEST:PROVISION_DONE` | Final marker | Provisioning complete, device ready |
+| `TEST:PROVISION_FAIL` | Fatal error | Provisioning failed, device unusable |
+
+**Note:** The test firmware **never prints** the Wi-Fi password or device private key to serial.
+
+### Failure Modes
+
+If provisioning fails, the device halts and prints an error code:
+
+- `reason=key_init` — Device key initialization failed
+- `reason=clear_failed` — Could not clear existing Wi-Fi data
+- `reason=write_failed` — Could not write test credentials
+- `reason=crc_fail` — CRC validation failed after write
+- `reason=count_mismatch` — Wrong number of networks stored
+- `reason=ssid_mismatch` — SSID readback verification failed
+- `reason=password_mismatch` — Password readback verification failed
+- `reason=timeout` — Wi-Fi connection timeout (30 seconds)
+
+### Test Harness Integration
+
+Example Python test harness:
+
+```python
+import serial
+import time
+
+def provision_device(port='/dev/ttyUSB0'):
+    ser = serial.Serial(port, 115200, timeout=60)
+    
+    results = {
+        'key_addr': None,
+        'wifi_stored': False,
+        'wifi_connected': False,
+        'ip_address': None,
+        'connect_time_ms': None,
+        'done': False
+    }
+    
+    start_time = time.time()
+    
+    while time.time() - start_time < 60:  # 60 second timeout
+        line = ser.readline().decode('utf-8', errors='ignore').strip()
+        
+        if line.startswith('TEST:KEY_ADDR='):
+            results['key_addr'] = line.split('=')[1]
+        elif line.startswith('TEST:WIFI_STORED='):
+            results['wifi_stored'] = 'OK' in line
+        elif line.startswith('TEST:WIFI_CONNECT='):
+            if 'OK' in line:
+                results['wifi_connected'] = True
+                # Parse ip=... and ms=...
+                parts = line.split()
+                for part in parts:
+                    if part.startswith('ip='):
+                        results['ip_address'] = part.split('=')[1]
+                    elif part.startswith('ms='):
+                        results['connect_time_ms'] = int(part.split('=')[1])
+        elif line.startswith('TEST:PROVISION_DONE'):
+            results['done'] = True
+            break
+        elif line.startswith('TEST:PROVISION_FAIL'):
+            raise Exception(f"Provisioning failed: {line}")
+    
+    ser.close()
+    
+    if not results['done']:
+        raise Exception("Provisioning timeout")
+    
+    return results
+```
+
+### EEPROM Layout After Provisioning
+
+The test firmware writes the exact same EEPROM layout as the production setup firmware:
+
+```
+[0-32]   Device private key (Web3E KeyID format)
+[33+]    Test Wi-Fi credentials (WifiStore format)
+```
+
+Production firmware flashed afterward can read these credentials using the WifiStore library.
+
+### Security Note
+
+**Do not use test credentials in production devices.** The test network credentials are only for factory testing. Production devices should use the regular setup firmware's captive portal to provision customer Wi-Fi networks.
+
 ## Project Structure
 
 ```
 .
-├── platformio.ini          # PlatformIO configuration (edit build_flags here)
+├── platformio.ini                 # PlatformIO configuration (3 environments)
 ├── src/
-│   └── main.cpp            # Setup firmware logic
+│   └── main.cpp                   # Setup firmware logic (production + test modes)
 ├── lib/
-│   └── WifiStore/          # Reusable Wi-Fi credential storage library
+│   └── WifiStore/                 # Reusable Wi-Fi credential storage library
 │       ├── WifiStore.h
 │       └── WifiStore.cpp
+├── scripts/
+│   └── inject_test_secrets.py     # Pre-build script for test_provision env
 ├── test/
-│   └── test_wifistore.cpp  # Native unit tests for WifiStore
-├── .gitignore              # Excludes .pio/, .vscode/, etc.
-├── LICENSE                 # Project license
-└── README.md               # This file
+│   ├── test_wifistore.cpp         # Native unit tests for WifiStore
+│   ├── test_secrets.ini.example   # Template for test credentials
+│   └── test_secrets.ini           # (gitignored) Actual test credentials
+├── .gitignore                     # Excludes .pio/, test_secrets.ini, etc.
+├── LICENSE                        # Project license
+└── README.md                      # This file
 ```
+
+### PlatformIO Environments
+
+- **`esp32dev`** (default): Production setup firmware with captive portal and OTA
+- **`test_provision`**: Hardware test variant for automated provisioning
+- **`native`**: Native unit tests for WifiStore library
 
 ## Dependencies
 

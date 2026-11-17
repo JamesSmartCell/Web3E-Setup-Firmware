@@ -19,4 +19,6 @@ libdeps/
 *.log
 
 # Environment-specific
+.env
+test_secrets.ini
 platformio_override.ini
