@@ -2,7 +2,6 @@
 
 A PlatformIO-based provisioning firmware for ESP32 Web3E projects. This firmware handles Wi-Fi configuration and OTA installation of project-specific firmware from Cloudflare R2, coordinated through SmartLayerProxy.
 
-**Owner:** Rob (JamesSmartCell)  
 **Web3E Library:** https://github.com/AlphaWallet/Web3E
 
 ## Purpose
