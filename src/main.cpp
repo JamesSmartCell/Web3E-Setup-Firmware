@@ -89,13 +89,13 @@ void setup() {
     Serial.println("Mode: TEST_PROVISION (Hardware Test Harness)");
     Serial.println("Initializing...");
     
-    // Initialize EEPROM
-    if (!wifiStore.begin()) {
-        Serial.println("ERROR: Failed to initialize EEPROM");
-        ESP.restart();
-    }
+    // CRITICAL ORDER: Initialize KeyID first, THEN WifiStore
+    // Web3E's KeyID calls EEPROM.begin(33), which in arduino-esp32 3.x
+    // TRUNCATES the NVS blob if called after a larger EEPROM.begin().
+    // WifiStore.begin() must be called AFTER KeyID to set the final size.
+    // DO NOT reorder without understanding this truncation hazard.
     
-    // Run test provisioning and halt
+    // Run test provisioning (creates KeyID internally, then initializes WifiStore)
     runTestProvisioning();
     // Never returns to normal flow
     return;
@@ -103,14 +103,20 @@ void setup() {
     Serial.println("Mode: Production Setup");
     Serial.println("Initializing...");
     
-    // Initialize EEPROM for WifiStore (KeyID initializes its own EEPROM region)
+    // CRITICAL ORDER: Initialize KeyID first, THEN WifiStore
+    // Web3E's KeyID calls EEPROM.begin(33), which in arduino-esp32 3.x
+    // TRUNCATES the NVS blob if called after a larger EEPROM.begin().
+    // WifiStore.begin() must be called AFTER KeyID to set the final size.
+    // DO NOT reorder without understanding this truncation hazard.
+    
+    // Initialize device key (Web3E KeyID) - calls EEPROM.begin(33)
+    initializeDeviceKey();
+    
+    // Initialize WifiStore - must come AFTER KeyID to expand EEPROM size
     if (!wifiStore.begin()) {
-        Serial.println("ERROR: Failed to initialize EEPROM");
+        Serial.println("ERROR: Failed to initialize EEPROM for WifiStore");
         ESP.restart();
     }
-    
-    // Initialize device key (Web3E KeyID)
-    initializeDeviceKey();
     
     // Try to connect to stored Wi-Fi networks
     if (connectToStoredNetworks()) {
@@ -607,10 +613,10 @@ void runTestProvisioning() {
     #error "TEST_WIFI_PASS not defined - test_secrets.ini missing?"
     #endif
     
-    // Step 1: Ensure device key exists
+    // Step 1: Ensure device key exists (KeyID must be created first)
     Serial.println("Step 1: Initialize device key...");
     web3 = new Web3(1);
-    deviceKey = new KeyID(web3);
+    deviceKey = new KeyID(web3);  // Calls EEPROM.begin(33)
     
     if (!deviceKey->hasRecoveredKey()) {
         Serial.println("ERROR: Failed to initialize device key");
@@ -620,6 +626,15 @@ void runTestProvisioning() {
     
     String deviceAddress = deviceKey->getAddress().c_str();
     Serial.println("TEST:KEY_ADDR=" + deviceAddress);
+    
+    // Step 1b: Initialize WifiStore AFTER KeyID to expand EEPROM size
+    // KeyID called EEPROM.begin(33), now we expand to full size
+    Serial.println("Step 1b: Initialize WifiStore EEPROM...");
+    if (!wifiStore.begin()) {
+        Serial.println("ERROR: Failed to initialize EEPROM for WifiStore");
+        Serial.println("TEST:PROVISION_FAIL reason=eeprom_init");
+        while(1) delay(1000);
+    }
     
     // Step 2: Write test Wi-Fi credentials to WifiStore
     Serial.println("Step 2: Write test Wi-Fi credentials to EEPROM...");

@@ -51,6 +51,17 @@ bool WifiStore::begin() {
     if (!EEPROM.begin(TOTAL_EEPROM_SIZE)) {
         return false;
     }
+    
+    // Guard against EEPROM truncation bug in arduino-esp32 3.x
+    // If KeyID's EEPROM.begin(33) was called after our EEPROM.begin(TOTAL_EEPROM_SIZE),
+    // the NVS blob would be truncated to 33 bytes. Detect this and fail with clear message.
+    if (EEPROM.length() < TOTAL_EEPROM_SIZE) {
+        Serial.println("ERROR: EEPROM size too small!");
+        Serial.printf("Expected: %d bytes, Actual: %d bytes\n", TOTAL_EEPROM_SIZE, EEPROM.length());
+        Serial.println("CRITICAL: KeyID must be initialized BEFORE WifiStore.begin()");
+        Serial.println("Web3E's EEPROM.begin(33) truncates if called after WifiStore.begin()");
+        return false;
+    }
 #endif
     isInitialized = true;
     return true;
@@ -158,6 +169,13 @@ bool WifiStore::isValid() {
 }
 
 int WifiStore::readNetworks(WifiCredential* credentials, int maxCount) {
+#ifndef NATIVE_TEST
+    // Guard against EEPROM truncation
+    if (EEPROM.length() < TOTAL_EEPROM_SIZE) {
+        Serial.println("ERROR: EEPROM too small for WifiStore read");
+        return 0;
+    }
+#endif
     return readStoredNetworks(credentials, maxCount, true);
 }
 
@@ -203,6 +221,14 @@ int WifiStore::readStoredNetworks(WifiCredential* credentials, int maxCount, boo
 bool WifiStore::writeNetworks(const WifiCredential* credentials, int count) {
     if (!isInitialized) return false;
     if (count > MAX_WIFI_NETWORKS) return false;
+    
+#ifndef NATIVE_TEST
+    // Guard against EEPROM truncation
+    if (EEPROM.length() < TOTAL_EEPROM_SIZE) {
+        Serial.println("ERROR: EEPROM too small for WifiStore write");
+        return false;
+    }
+#endif
     
     // Write header
     if (!writeHeader()) return false;
