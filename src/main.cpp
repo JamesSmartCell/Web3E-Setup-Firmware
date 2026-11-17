@@ -756,7 +756,10 @@ void handleRoot() {
         "<button id=\"done-btn\" class=\"success\" onclick=\"commitAndConnect()\" style=\"width:100%;margin-top:20px;font-size:16px\">Done - Connect & Update Firmware</button>"
         "</div><script>"
         "let networksData=[];"
+        "let networksBySsid={};"
         "let statusPollInterval=null;"
+        "let selectFocused=false;"
+        "let userHasSelected=false;"
         "function showStatus(msg,type){"
         "const s=document.getElementById('status');s.textContent=msg;"
         "s.className='status '+(type||'success');"
@@ -765,39 +768,48 @@ void handleRoot() {
         "const inp=document.getElementById(id);"
         "inp.type=inp.type==='password'?'text':'password';}"
         "function pollNetworks(){"
+        "if(selectFocused){return;}"
         "fetch('/scan').then(r=>r.json()).then(data=>{"
         "const status=document.getElementById('scan-status');"
         "const sel=document.getElementById('network-select');"
         "if(data.scanning){status.textContent='Scanning...';return;}"
         "status.textContent='';"
         "if(!data.networks||data.networks.length===0){return;}"
-        "const currentVal=sel.value;"
+        "const currentSSID=sel.value;"
         "networksData=data.networks;"
+        "networksBySsid={};"
+        "data.networks.forEach(net=>{networksBySsid[net.ssid]=net;});"
         "sel.innerHTML='<option value=\"\">-- Select a network --</option>';"
-        "data.networks.forEach((net,idx)=>{"
+        "data.networks.forEach(net=>{"
         "const signal=net.rssi>-50?'▂▄▆█':(net.rssi>-70?'▂▄▆_':'▂▄__');"
         "const opt=document.createElement('option');"
-        "opt.value=idx;"
+        "opt.value=net.ssid;"
         "opt.textContent=net.ssid+' '+signal+(net.encrypted?' 🔒':'');"
         "opt.dataset.encrypted=net.encrypted;"
         "sel.appendChild(opt);});"
-        "if(currentVal)sel.value=currentVal;"
+        "if(currentSSID&&networksBySsid[currentSSID]){sel.value=currentSSID;}"
         "}).catch(e=>console.log(e));}"
+        "document.getElementById('network-select').addEventListener('focus',()=>{selectFocused=true;});"
+        "document.getElementById('network-select').addEventListener('blur',()=>{selectFocused=false;});"
         "function onNetworkSelected(){"
         "const sel=document.getElementById('network-select');"
         "const pwdSection=document.getElementById('network-pwd-section');"
-        "if(!sel.value){pwdSection.classList.add('hidden');return;}"
-        "const net=networksData[sel.value];"
+        "if(!sel.value){pwdSection.classList.add('hidden');userHasSelected=false;return;}"
+        "userHasSelected=true;"
+        "const net=networksBySsid[sel.value];"
+        "if(!net){pwdSection.classList.add('hidden');return;}"
         "if(net.encrypted){pwdSection.classList.remove('hidden');"
         "document.getElementById('network-password').value='';"
         "}else{pwdSection.classList.add('hidden');}}"
         "function addSelectedNetwork(){"
         "const sel=document.getElementById('network-select');"
-        "if(!sel.value){showStatus('Please select a network','error');return;}"
-        "const net=networksData[sel.value];"
+        "const ssid=sel.value;"
+        "if(!ssid){showStatus('Please select a network','error');return;}"
+        "const net=networksBySsid[ssid];"
+        "if(!net){showStatus('Network not found','error');return;}"
         "const pwd=net.encrypted?document.getElementById('network-password').value:'';"
         "if(net.encrypted&&!pwd){showStatus('Please enter password','error');return;}"
-        "addNetwork(net.ssid,pwd);}"
+        "addNetwork(ssid,pwd);}"
         "function addHiddenNetwork(){"
         "const ssid=document.getElementById('hidden-ssid').value.trim();"
         "const pwd=document.getElementById('hidden-password').value;"
@@ -871,7 +883,8 @@ void handleSave() {
     String password = webServer.hasArg("password") ? webServer.arg("password") : "";
     
     // Log lengths for debugging (never log actual credentials)
-    Serial.printf("Adding network: SSID length=%d, password length=%d\n", ssid.length(), password.length());
+    Serial.printf("Adding network: SSID='%s' (length=%d), password length=%d\n", 
+                  ssid.c_str(), ssid.length(), password.length());
     
     // Verify no URL encoding artifacts
     if (ssid.indexOf('+') >= 0 || ssid.indexOf('%') >= 0) {
@@ -880,7 +893,8 @@ void handleSave() {
     
     if (wifiStore.appendNetwork(ssid.c_str(), password.c_str())) {
         Serial.printf("Network added to list: '%s' (length %d)\n", ssid.c_str(), ssid.length());
-        webServer.send(200, "text/plain", "Network added to list");
+        String response = "Saved " + ssid;
+        webServer.send(200, "text/plain", response);
     } else {
         Serial.println("Failed to add network (storage full or error)");
         webServer.send(500, "text/plain", "Failed to add network (storage may be full)");
