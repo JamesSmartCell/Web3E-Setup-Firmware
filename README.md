@@ -70,7 +70,11 @@ For testing without the proxy, configure `FIRMWARE_URL` and optionally `FIRMWARE
    - Device starts access point: `ESP32-Setup-XXXX` (where XXXX = last 4 hex digits of MAC)
    - Connect phone/laptop to AP
    - Captive portal auto-opens (or navigate to `192.168.4.1`)
-   - Scan networks, select one, enter password, click "Connect & Save"
+   - Networks are scanned automatically and refresh every ~12 seconds
+   - Tap a network to add it (enter password when prompted)
+   - Or add a hidden network manually
+   - Review your "Saved Networks" list
+   - Click "Done - Connect & Update Firmware" to proceed
 
 6. **Automatic OTA:**
    - Device connects to Wi-Fi
@@ -139,10 +143,11 @@ The ESP32 has 512 bytes of emulated EEPROM in flash. This firmware shares EEPROM
 
 ## Using WifiStore in Production Firmware
 
-Production firmwares can read Wi-Fi credentials from EEPROM using the `WifiStore` library:
+**Important:** This setup firmware uses `SetupWifiStore` (extended version with write operations). Production firmwares should use Web3E's built-in read-only `WifiStore` class, which is byte-compatible:
 
 ```cpp
-#include <WifiStore.h>
+#include <Web3.h>
+#include <WifiStore.h>  // From Web3E library
 
 WifiStore wifiStore;
 wifiStore.begin();
@@ -156,18 +161,19 @@ for (int i = 0; i < count; i++) {
 }
 ```
 
-Copy `lib/WifiStore/` into your project's `lib/` directory or install as a PlatformIO library.
-
-**API Reference:**
-
+Web3E's `WifiStore` (v1.45.0+, commit 59e427f or later) provides read-only access:
 - `bool begin()` — Initialize EEPROM
 - `bool isValid()` — Check if stored data has valid magic/CRC
 - `int readNetworks(WifiCredential* creds, int maxCount)` — Read all networks
+- `int getNetworkCount()` — Count stored networks
+
+The EEPROM layout is identical between `SetupWifiStore` (this firmware) and Web3E's `WifiStore`, so production firmware can read credentials written by the setup firmware.
+
+**For custom setup firmware** that needs write operations, copy `lib/WifiStore/` (renamed to `SetupWifiStore`) into your project. It provides additional write methods:
 - `bool writeNetworks(const WifiCredential* creds, int count)` — Overwrite all networks
 - `bool appendNetwork(const char* ssid, const char* password)` — Add one network
 - `bool removeNetwork(int index)` — Remove by index
 - `bool clearNetworks()` — Erase all networks (keeps valid structure)
-- `int getNetworkCount()` — Count stored networks
 
 ## Build & Flash Commands
 
@@ -211,6 +217,20 @@ Edit `platformio.ini` under `[env:esp32dev]` → `build_flags`:
 | `MAX_WIFI_NETWORKS` | No | 8 | Maximum networks to store in EEPROM |
 
 *Either `PROXY_BASE_URL` + `PROJECT_ID` OR `FIRMWARE_URL` must be configured.
+
+## Captive Portal Features
+
+The setup firmware provides a mobile-friendly captive portal with automatic Wi-Fi provisioning:
+
+- **Auto-scanning:** Networks are scanned on startup and refreshed every ~12 seconds (no manual "Scan" button)
+- **Deduplicated list:** SSIDs are deduplicated, sorted by signal strength (strongest first)
+- **Signal indicators:** Visual signal strength bars (▂▄▆█) and lock icons (🔒) for encrypted networks
+- **Tap to add:** Tap any network in the list to add it (password prompt appears for secured networks)
+- **Hidden networks:** Manual entry field for SSIDs not broadcast
+- **Saved Networks list:** Shows all networks queued for connection (SSID only, passwords never displayed)
+- **Password visibility toggle:** 👁 button to show/hide passwords during entry
+- **Done button:** Commits saved networks to EEPROM, attempts connection, and starts firmware update
+- **Mobile compatibility:** Tested on iOS and Android captive portal browsers (no external dependencies)
 
 ## OTA Partition Scheme
 
@@ -259,9 +279,11 @@ When OTA updates are applied, the ESP32 bootloader alternates between `app0` and
 - **Recommendation:** Set `AP_PASSWORD` for sensitive deployments
 
 ### Firmware Verification
-- **SHA-256 hash:** Provided by SmartLayerProxy, verified before flashing
+- **SHA-256 hash:** Provided by SmartLayerProxy, **cryptographically verified** using mbedtls during download
+- **Streaming verification:** Hash is computed as the firmware is downloaded (not post-download)
+- **Abort on mismatch:** Update is aborted immediately if SHA-256 does not match expected value
 - **Size check:** Expected size validated during download
-- **HTTPUpdate library:** Performs integrity checks during OTA process
+- **Applies to both paths:** Direct URL (`FIRMWARE_URL`) and proxy-based downloads
 
 ## Recovery Procedure
 
@@ -552,11 +574,14 @@ Production firmware flashed afterward can read these credentials using the WifiS
 ## Dependencies
 
 - **PlatformIO:** ESP32 framework (Arduino)
-- **Web3E:** https://github.com/AlphaWallet/Web3E (device key management)
-- **ArduinoJson:** JSON parsing for proxy responses
+- **Web3E:** https://github.com/AlphaWallet/Web3E#59e427f (device key management, pinned to commit 59e427f)
+- **ArduinoJson:** JSON parsing for proxy responses (v7.0.0+)
 - **ESP32 Arduino Core:** WiFi, HTTPClient, HTTPUpdate, WebServer, DNSServer
+- **mbedtls:** SHA-256 verification (included with ESP32 Arduino Core)
 
 Install via `pio lib install` or auto-resolved from `lib_deps` in `platformio.ini`.
+
+**Note:** Web3E is pinned to commit `59e427f` (or later) which includes `WEB3E_EEPROM_SIZE` definition and the read-only `WifiStore` class. This ensures compatibility between setup firmware and production firmware.
 
 ## License
 

@@ -1,7 +1,7 @@
 #include <unity.h>
 #include <string.h>
 #include <cstdio>
-#include "../lib/WifiStore/WifiStore.h"
+#include "../lib/WifiStore/SetupWifiStore.h"
 
 // Mock EEPROM for testing
 static uint8_t mockEEPROM[TOTAL_EEPROM_SIZE];

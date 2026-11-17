@@ -3,7 +3,7 @@
 #include <EEPROM.h>
 #endif
 
-#include "WifiStore.h"
+#include "SetupWifiStore.h"
 
 static const char WIFI_MAGIC[4] = {'W', 'I', 'F', 'I'};
 static const uint8_t WIFI_VERSION = 1;

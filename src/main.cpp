@@ -8,9 +8,9 @@
 #include <EEPROM.h>
 #include <ArduinoJson.h>
 #include <mbedtls/sha256.h>
-#include "WifiStore.h"
 #include <Web3.h>
 #include <KeyID.h>
+#include "SetupWifiStore.h"
 
 // Configuration from build flags
 #ifndef PROXY_BASE_URL
