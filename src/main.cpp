@@ -68,6 +68,8 @@ bool scanInProgress = false;
 int lastScanCount = 0;
 bool otaInProgress = false;
 String otaStatus = "";
+String lastFailedSSID = "";
+String lastFailReason = "";
 
 // Forward declarations
 void setupAccessPoint();
@@ -212,15 +214,37 @@ bool connectToStoredNetworks() {
     
     if (count == 0) {
         Serial.println("No stored Wi-Fi networks found");
+        lastFailReason = "No networks saved";
         return false;
     }
     
     Serial.printf("Found %d stored network(s), attempting to connect...\n", count);
     
-    WiFi.mode(WIFI_STA);
+    // Stop any in-progress scan before connecting
+    if (scanInProgress) {
+        int scanResult = WiFi.scanComplete();
+        if (scanResult == WIFI_SCAN_RUNNING) {
+            Serial.println("Stopping in-progress scan before connecting...");
+            WiFi.scanDelete();
+        }
+        scanInProgress = false;
+    }
+    
+    // Stay in AP+STA mode if AP is active (for status updates)
+    if (WiFi.getMode() == WIFI_AP || WiFi.getMode() == WIFI_AP_STA) {
+        WiFi.mode(WIFI_AP_STA);
+        Serial.println("Connecting in AP+STA mode (AP stays active for status)");
+    } else {
+        WiFi.mode(WIFI_STA);
+    }
     
     for (int i = 0; i < count; i++) {
-        Serial.printf("Trying network %d: %s\n", i + 1, networks[i].ssid);
+        Serial.printf("\nTrying network %d: '%s' (SSID length=%d, password length=%d)\n", 
+                      i + 1, networks[i].ssid, networks[i].ssidLen, networks[i].pwLen);
+        
+        // Disconnect from previous attempt
+        WiFi.disconnect(true);
+        delay(100);
         
         if (networks[i].pwLen > 0) {
             WiFi.begin(networks[i].ssid, networks[i].password);
@@ -229,7 +253,15 @@ bool connectToStoredNetworks() {
         }
         
         unsigned long startTime = millis();
-        while (WiFi.status() != WL_CONNECTED && (millis() - startTime) < WIFI_CONNECT_TIMEOUT_MS) {
+        unsigned long timeout = 20000; // 20 second timeout per network
+        wl_status_t lastStatus = WL_IDLE_STATUS;
+        
+        while (WiFi.status() != WL_CONNECTED && (millis() - startTime) < timeout) {
+            wl_status_t currentStatus = WiFi.status();
+            if (currentStatus != lastStatus) {
+                Serial.printf(" [status: %d] ", currentStatus);
+                lastStatus = currentStatus;
+            }
             delay(500);
             Serial.print(".");
         }
@@ -239,10 +271,30 @@ bool connectToStoredNetworks() {
             Serial.println("Connected!");
             Serial.print("IP Address: ");
             Serial.println(WiFi.localIP());
+            lastFailedSSID = "";
+            lastFailReason = "";
             return true;
         } else {
-            Serial.printf("Failed to connect to %s\n", networks[i].ssid);
-            WiFi.disconnect();
+            wl_status_t finalStatus = WiFi.status();
+            String statusStr = "Unknown";
+            switch (finalStatus) {
+                case WL_NO_SSID_AVAIL: statusStr = "Network not found"; break;
+                case WL_CONNECT_FAILED: statusStr = "Connection failed (wrong password?)"; break;
+                case WL_CONNECTION_LOST: statusStr = "Connection lost"; break;
+                case WL_DISCONNECTED: statusStr = "Disconnected"; break;
+                case WL_IDLE_STATUS: statusStr = "Idle/timeout"; break;
+                default: statusStr = "Status " + String(finalStatus); break;
+            }
+            
+            Serial.printf("Failed to connect to '%s': %s (WiFi.status=%d)\n", 
+                          networks[i].ssid, statusStr.c_str(), finalStatus);
+            
+            lastFailedSSID = String(networks[i].ssid);
+            lastFailReason = statusStr;
+            otaStatus = "Failed to connect to '" + lastFailedSSID + "': " + lastFailReason;
+            
+            WiFi.disconnect(true);
+            delay(100);
         }
     }
     
@@ -818,8 +870,16 @@ void handleSave() {
     String ssid = webServer.arg("ssid");
     String password = webServer.hasArg("password") ? webServer.arg("password") : "";
     
+    // Log lengths for debugging (never log actual credentials)
+    Serial.printf("Adding network: SSID length=%d, password length=%d\n", ssid.length(), password.length());
+    
+    // Verify no URL encoding artifacts
+    if (ssid.indexOf('+') >= 0 || ssid.indexOf('%') >= 0) {
+        Serial.println("WARNING: SSID may contain URL-encoded characters");
+    }
+    
     if (wifiStore.appendNetwork(ssid.c_str(), password.c_str())) {
-        Serial.println("Network added to list: " + ssid);
+        Serial.printf("Network added to list: '%s' (length %d)\n", ssid.c_str(), ssid.length());
         webServer.send(200, "text/plain", "Network added to list");
     } else {
         Serial.println("Failed to add network (storage full or error)");
@@ -872,12 +932,13 @@ void handleDone() {
     
     otaInProgress = true;
     otaStatus = "Connecting to Wi-Fi...";
+    lastFailedSSID = "";
+    lastFailReason = "";
     
     webServer.send(200, "text/plain", "Connecting to saved networks...");
     
-    WiFi.mode(WIFI_STA);
-    WiFi.disconnect();
-    delay(100);
+    // Keep AP active during connection attempts for status updates
+    // connectToStoredNetworks will handle mode switching
     
     if (connectToStoredNetworks()) {
         Serial.println("Connected to Wi-Fi!");
@@ -894,16 +955,21 @@ void handleDone() {
         }
     } else {
         Serial.println("Failed to connect to any saved network");
-        otaStatus = "Failed to connect to Wi-Fi";
+        Serial.printf("Last failed SSID: '%s', Reason: %s\n", lastFailedSSID.c_str(), lastFailReason.c_str());
+        // otaStatus already set in connectToStoredNetworks with details
         otaInProgress = false;
-        setupAccessPoint();
+        // Don't call setupAccessPoint() - AP is still running in AP+STA mode
     }
 }
 
 void handleStatus() {
     String json = "{\"inProgress\":" + String(otaInProgress ? "true" : "false");
     json += ",\"status\":\"" + otaStatus + "\"";
-    json += ",\"error\":" + String((otaStatus.indexOf("Failed") >= 0) ? "true" : "false");
+    json += ",\"error\":" + String((otaStatus.indexOf("Failed") >= 0 || otaStatus.indexOf("failed") >= 0) ? "true" : "false");
+    if (lastFailedSSID.length() > 0) {
+        json += ",\"failedSSID\":\"" + lastFailedSSID + "\"";
+        json += ",\"failReason\":\"" + lastFailReason + "\"";
+    }
     json += "}";
     webServer.send(200, "application/json", json);
 }

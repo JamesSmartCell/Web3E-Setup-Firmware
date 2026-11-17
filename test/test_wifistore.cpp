@@ -234,6 +234,61 @@ void test_max_networks_limit(void) {
     TEST_ASSERT_EQUAL(MAX_WIFI_NETWORKS, store.getNetworkCount());
 }
 
+void test_ssid_with_spaces(void) {
+    TestableWifiStore store;
+    store.begin();
+    
+    // Test SSID with spaces (like "Robot Overlord")
+    const char* ssidWithSpace = "Robot Overlord";
+    const char* password = "MyP@ssw0rd";
+    
+    TEST_ASSERT_TRUE(store.appendNetwork(ssidWithSpace, password));
+    
+    WifiCredential readCreds[MAX_WIFI_NETWORKS];
+    int count = store.readNetworks(readCreds, MAX_WIFI_NETWORKS);
+    
+    TEST_ASSERT_EQUAL(1, count);
+    TEST_ASSERT_EQUAL_STRING(ssidWithSpace, readCreds[0].ssid);
+    TEST_ASSERT_EQUAL_STRING(password, readCreds[0].password);
+    TEST_ASSERT_EQUAL(14, readCreds[0].ssidLen); // "Robot Overlord" length
+}
+
+void test_special_characters(void) {
+    TestableWifiStore store;
+    store.begin();
+    
+    // Test SSID and password with special characters
+    const char* ssidSpecial = "Café-WiFi_5G!";
+    const char* passwordSpecial = "P@ss#123&word%";
+    
+    TEST_ASSERT_TRUE(store.appendNetwork(ssidSpecial, passwordSpecial));
+    
+    WifiCredential readCreds[MAX_WIFI_NETWORKS];
+    int count = store.readNetworks(readCreds, MAX_WIFI_NETWORKS);
+    
+    TEST_ASSERT_EQUAL(1, count);
+    TEST_ASSERT_EQUAL_STRING(ssidSpecial, readCreds[0].ssid);
+    TEST_ASSERT_EQUAL_STRING(passwordSpecial, readCreds[0].password);
+}
+
+void test_multiple_ssids_with_spaces(void) {
+    TestableWifiStore store;
+    store.begin();
+    
+    // Test multiple networks with spaces
+    TEST_ASSERT_TRUE(store.appendNetwork("Robot Overlord", "password1"));
+    TEST_ASSERT_TRUE(store.appendNetwork("Necroponte", "password2"));
+    TEST_ASSERT_TRUE(store.appendNetwork("Smart Home 2.4G", "password3"));
+    
+    WifiCredential readCreds[MAX_WIFI_NETWORKS];
+    int count = store.readNetworks(readCreds, MAX_WIFI_NETWORKS);
+    
+    TEST_ASSERT_EQUAL(3, count);
+    TEST_ASSERT_EQUAL_STRING("Robot Overlord", readCreds[0].ssid);
+    TEST_ASSERT_EQUAL_STRING("Necroponte", readCreds[1].ssid);
+    TEST_ASSERT_EQUAL_STRING("Smart Home 2.4G", readCreds[2].ssid);
+}
+
 int main(int argc, char **argv) {
     UNITY_BEGIN();
     
@@ -248,6 +303,9 @@ int main(int argc, char **argv) {
     RUN_TEST(test_max_password_length);
     RUN_TEST(test_open_network);
     RUN_TEST(test_max_networks_limit);
+    RUN_TEST(test_ssid_with_spaces);
+    RUN_TEST(test_special_characters);
+    RUN_TEST(test_multiple_ssids_with_spaces);
     
     return UNITY_END();
 }
