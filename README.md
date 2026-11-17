@@ -213,6 +213,7 @@ Edit `platformio.ini` under `[env:esp32dev]` → `build_flags`:
 | Flag | Required | Default | Description |
 |------|----------|---------|-------------|
 | `board_build.partitions` | **CRITICAL** | `min_spiffs.csv` | **Partition table - MUST match target firmware!** |
+| `APP_NAME` | No | `PROJECT_ID` | Application name shown in portal title (e.g., `GarageDoor`) |
 | `PROXY_BASE_URL` | Yes* | - | SmartLayerProxy base URL (e.g., `https://scriptproxy.percolate.one`) |
 | `PROJECT_ID` | Yes* | - | Unique project identifier for proxy API (e.g., `garagedoor`) |
 | `FIRMWARE_URL` | No | - | Direct firmware URL (overrides proxy, for testing) |
