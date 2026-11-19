@@ -74,7 +74,7 @@ For testing without the proxy, configure `FIRMWARE_URL` and optionally `FIRMWARE
    - Device starts access point: `ESP32-Setup-XXXX` (where XXXX = last 4 hex digits of MAC)
    - Connect phone/laptop to AP
    - Captive portal auto-opens (or navigate to `192.168.4.1`)
-   - Networks are scanned automatically and refresh every ~12 seconds
+   - Networks are scanned once at boot; tap **Refresh Networks** to rescan (no periodic rescan)
    - Tap a network to add it (enter password when prompted)
    - Or add a hidden network manually
    - Review your "Saved Networks" list
@@ -87,6 +87,47 @@ For testing without the proxy, configure `FIRMWARE_URL` and optionally `FIRMWARE
    - Verifies SHA-256 hash and size
    - Flashes OTA partition
    - Reboots into production firmware
+
+## Stay-in-Portal / Revoke Flag Contract (NVS)
+
+**Storage:** ESP32 NVS via Arduino `Preferences` — **not** EEPROM. KeyID (EEPROM 0–32) and WifiStore (EEPROM 33+) are never modified by this path.
+
+| Item | Value |
+|------|--------|
+| NVS namespace | `web3e_boot` |
+| Key `stay_portal` | `uint8_t`: `1` = stay in setup portal; `0` = normal |
+| Key `boot_count` | `uint8_t`: consecutive quick-reboot counter |
+
+### Revocation flow (app firmware must match)
+
+1. Proxy sends admin-signed revoke over the device TCP channel.
+2. **App firmware** sets `stay_portal = 1` in NVS namespace `web3e_boot`, then OTA-installs **this** setup firmware (from the same project R2 store, sha256-verified) and reboots.
+3. Setup boots, reads `stay_portal == 1`, **skips** auto Wi-Fi connect and app OTA, opens the captive portal.
+4. **Saved Wi-Fi credentials are preserved** and shown in the portal so the user can confirm or change them.
+5. When the user taps **Done**, setup clears `stay_portal` to `0`, then connects and downloads the (new) app firmware.
+
+### Offline reset: triple power-cycle (app + setup must match)
+
+| Constant | Value | Meaning |
+|----------|-------|---------|
+| `PORTAL_BOOT_TRIPLE_THRESHOLD` | `3` | Quick reboots required to force portal |
+| `PORTAL_BOOT_STABLE_MS` | `10000` (10 s) | Uptime after which `boot_count` is cleared |
+
+**Behaviour:**
+
+1. Every boot increments `boot_count` (persisted in NVS).
+2. If `boot_count >= 3` before the stable window, the device sets `stay_portal = 1`, resets `boot_count` to `0`, and opens the portal (same path as revoke — no auto app download).
+3. After ~10 s continuous uptime, `boot_count` is cleared to `0`.
+4. **A router outage / Wi-Fi down alone must never open the AP.** Only `stay_portal` or this triple-cycle path forces the portal when credentials already exist.
+
+App firmware should use the same namespace/keys and timings so a triple power-cycle while running the app can OTA back to setup (or otherwise enter setup) consistently. The reusable implementation lives in `lib/PortalBoot/` (candidate for Web3E later).
+
+### What must match on other repos
+
+| Side | Requirement |
+|------|-------------|
+| **App (NFT-Gated-ESP-Control)** | On revoke: `Preferences("web3e_boot").putUChar("stay_portal", 1)` before OTA to setup. Same triple-cycle counter/timings. Never erase KeyID. |
+| **Proxy (SmartLayerProxy)** | Serve setup firmware from project R2 like app firmware; push revoke notice on existing device channel. |
 
 ## EEPROM Layout
 
@@ -230,14 +271,15 @@ Edit `platformio.ini` under `[env:esp32dev]` → `build_flags`:
 
 The setup firmware provides a mobile-friendly captive portal with automatic Wi-Fi provisioning:
 
-- **Auto-scanning:** Networks are scanned on startup and refreshed every ~12 seconds (no manual "Scan" button)
+- **Scan at boot + Refresh only:** One scan when the portal starts; **Refresh Networks** triggers another. No periodic ~12 s rescans (those used `WIFI_AP_STA` continuously and made classic ESP32 softAP unreliable — phone joins AP but `192.168.4.1` does not respond).
+- **No scan while AP clients connected (auto path):** Boot/auto scans are skipped if a station is already on the AP; after a scan finishes, mode returns to `WIFI_AP`.
 - **Deduplicated list:** SSIDs are deduplicated, sorted by signal strength (strongest first)
 - **Signal indicators:** Visual signal strength bars (▂▄▆█) and lock icons (🔒) for encrypted networks
 - **Tap to add:** Tap any network in the list to add it (password prompt appears for secured networks)
 - **Hidden networks:** Manual entry field for SSIDs not broadcast
 - **Saved Networks list:** Shows all networks queued for connection (SSID only, passwords never displayed)
 - **Password visibility toggle:** 👁 button to show/hide passwords during entry
-- **Done button:** Commits saved networks to EEPROM, attempts connection, and starts firmware update
+- **Done button:** Clears `stay_portal`, keeps Wi-Fi EEPROM, attempts connection, and starts firmware update
 - **Mobile compatibility:** Tested on iOS and Android captive portal browsers (no external dependencies)
 
 ## OTA Partition Scheme
@@ -331,6 +373,12 @@ When OTA updates are applied, the ESP32 bootloader alternates between `app0` and
 
 ## Recovery Procedure
 
+### Triple power-cycle (no USB)
+
+Power the device off and on **3 times**, each time within ~10 seconds of boot (before the stable window clears the counter). The device sets `stay_portal` and opens the setup portal. KeyID and saved Wi-Fi are preserved.
+
+### USB re-flash
+
 If Wi-Fi credentials are lost or the device cannot connect:
 
 1. **Re-flash setup firmware via USB:**
@@ -350,6 +398,8 @@ If the device key must be reset (generates new address):
    ```
 
 2. **Re-flash setup firmware** (device generates new key on next boot)
+
+**Do not** full-erase flash for revoke or normal recovery — that destroys the KeyID private key.
 
 ## Testing
 
@@ -595,9 +645,12 @@ Production firmware flashed afterward can read these credentials using the WifiS
 ├── src/
 │   └── main.cpp                   # Setup firmware logic (production + test modes)
 ├── lib/
-│   └── WifiStore/                 # Reusable Wi-Fi credential storage library
-│       ├── WifiStore.h
-│       └── WifiStore.cpp
+│   ├── WifiStore/                 # Reusable Wi-Fi credential storage library
+│   │   ├── SetupWifiStore.h
+│   │   └── SetupWifiStore.cpp
+│   └── PortalBoot/                # NVS stay_portal + triple power-cycle (shared contract)
+│       ├── PortalBoot.h
+│       └── PortalBoot.cpp
 ├── scripts/
 │   └── inject_test_secrets.py     # Pre-build script for test_provision env
 ├── test/
