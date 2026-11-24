@@ -129,24 +129,33 @@ App firmware should use the same namespace/keys and timings so a triple power-cy
 | **App (NFT-Gated-ESP-Control)** | On revoke: `Preferences("web3e_boot").putUChar("stay_portal", 1)` before OTA to setup. Same triple-cycle counter/timings. Never erase KeyID. |
 | **Proxy (SmartLayerProxy)** | Serve setup firmware from project R2 like app firmware; push revoke notice on existing device channel. |
 
-## EEPROM Layout
+## EEPROM Layout (Web3E v1.47)
 
-The ESP32 has 512 bytes of emulated EEPROM in flash. This firmware shares EEPROM with Web3E KeyID and production firmwares.
+**EEPROM Size:** 2048 bytes (matches Web3E v1.47 app firmware). This setup firmware uses the same EEPROM size as app firmware to prevent truncation during OTA transitions.
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│ Offset │ Size  │ Description                                │
-├─────────────────────────────────────────────────────────────┤
-│ 0      │ 1     │ KeyID Marker (0x40 = 64 when key present) │
-│ 1-32   │ 32    │ Device Private Key (ECDSA secp256k1)      │
-├─────────────────────────────────────────────────────────────┤
-│ 33     │ 4     │ Wi-Fi Magic: 'W' 'I' 'F' 'I' (0x57...)   │
-│ 37     │ 1     │ Wi-Fi Version (currently 1)               │
-│ 38+    │ var   │ Network Records (see below)               │
-│ ...    │ 2     │ Terminator: 0x00 0x00                     │
-│ end-4  │ 4     │ CRC32 (little-endian, covers magic→term)  │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│ Offset  │ Size  │ Description                                   │
+├──────────────────────────────────────────────────────────────────┤
+│ 0       │ 1     │ KeyID Marker (0x40 = 64 when key present)    │
+│ 1-32    │ 32    │ Device Private Key (ECDSA secp256k1)         │
+├──────────────────────────────────────────────────────────────────┤
+│ 33      │ 4     │ Wi-Fi Magic: 'W' 'I' 'F' 'I' (0x57...)      │
+│ 37      │ 1     │ Wi-Fi Version (currently 1)                  │
+│ 38+     │ var   │ Network Records (see below)                  │
+│ ...     │ 2     │ Terminator: 0x00 0x00                        │
+│ end-4   │ 4     │ CRC32 (little-endian, covers magic→term)     │
+├──────────────────────────────────────────────────────────────────┤
+│ 828     │ 4     │ RPC Cache Timestamp (Web3E v1.47+)           │
+│ 832     │ 4     │ RPC Cache ChainId (Web3E v1.47+)             │
+│ 836+    │ var   │ Signed RPC URL Records [len][url]...         │
+│ ...     │ ...   │ (managed by Web3E, never touched by setup)   │
+└──────────────────────────────────────────────────────────────────┘
 ```
+
+**NVS (Preferences, not EEPROM):**
+- `web3e_boot::stay_portal` (uint8_t): revoke flag
+- `web3e_boot::boot_count` (uint8_t): power-cycle counter
 
 ### KeyID Region (Bytes 0-32)
 
@@ -176,15 +185,35 @@ The ESP32 has 512 bytes of emulated EEPROM in flash. This firmware shares EEPROM
 - Invalid magic or CRC failure → no networks are read
 - Records are read/written atomically (all networks updated together)
 
-### Total EEPROM Usage
+### Total EEPROM Usage (v1.47)
 
-- KeyID region: 33 bytes
-- Wi-Fi header: 5 bytes (magic + version)
+| Region | Offset | Max Size | Description |
+|--------|--------|----------|-------------|
+| KeyID | 0-32 | 33 bytes | Device private key (never modified by setup) |
+| WifiStore | 33-827 | ~795 bytes | Wi-Fi credentials (header + 8 networks + terminator + CRC) |
+| RPC Cache | 828+ | ~1220 bytes | Signed RPC URLs (Web3E v1.47+, never modified by setup) |
+| **Total** | 0-2047 | **2048 bytes** | Shared with app firmware |
+
+**Breakdown of WifiStore region (33-827):**
+- Header: 5 bytes (magic + version)
 - Max per network: 1 + 32 + 1 + 64 = 98 bytes
 - Max 8 networks: 8 × 98 = 784 bytes
 - Terminator: 2 bytes
 - CRC: 4 bytes
-- **Total: ~828 bytes** (well under 512-byte EEPROM limit with default config)
+- **Total WifiStore: ~795 bytes**
+
+**Revoke flag and power-cycle counter are stored in NVS (Preferences), NOT in EEPROM, so they never conflict with KeyID, WifiStore, or RPC cache.**
+
+### Compatibility Note: Old v1.0.0 Setup (1024-byte EEPROM)
+
+**⚠️ BREAKING:** Setup firmware v1.0.0 (which used Web3E with 1024-byte EEPROM) **WILL TRUNCATE** a v1.47 app's RPC cache when OTA-reverting from app → setup. The cache region (828-2047) will be lost, and the app will need to re-fetch RPC URLs on the next boot.
+
+**OTA direction compatibility:**
+- **Setup v1.0.0 → App v1.47:** ✅ Safe (app expands EEPROM to 2048, old setup data preserved)
+- **App v1.47 → Setup v1.0.0:** ❌ TRUNCATES app's RPC cache (setup uses 1024-byte EEPROM)
+- **Setup v1.1.0 (this version) ↔ App v1.47:** ✅ Safe both directions (both use 2048 bytes)
+
+**Migration path:** Flash this setup firmware v1.1.0 (2048-byte EEPROM) via USB to any device currently running v1.0.0 setup or v1.47 app. All future OTA transitions will be safe.
 
 ## Using WifiStore in Production Firmware
 
@@ -206,7 +235,7 @@ for (int i = 0; i < count; i++) {
 }
 ```
 
-Web3E's `WifiStore` (v1.45.0+, commit 59e427f or later) provides read-only access:
+Web3E's `WifiStore` (v1.47+) provides read-only access:
 - `bool begin()` — Initialize EEPROM
 - `bool isValid()` — Check if stored data has valid magic/CRC
 - `int readNetworks(WifiCredential* creds, int maxCount)` — Read all networks
@@ -671,14 +700,14 @@ Production firmware flashed afterward can read these credentials using the WifiS
 ## Dependencies
 
 - **PlatformIO:** ESP32 framework (Arduino)
-- **Web3E:** https://github.com/AlphaWallet/Web3E#59e427f (device key management, pinned to commit 59e427f)
+- **Web3E:** https://github.com/AlphaWallet/Web3E (pinned to tag v1.47)
 - **ArduinoJson:** JSON parsing for proxy responses (v7.0.0+)
 - **ESP32 Arduino Core:** WiFi, HTTPClient, HTTPUpdate, WebServer, DNSServer
 - **mbedtls:** SHA-256 verification (included with ESP32 Arduino Core)
 
 Install via `pio lib install` or auto-resolved from `lib_deps` in `platformio.ini`.
 
-**Note:** Web3E is pinned to commit `59e427f` (or later) which includes `WEB3E_EEPROM_SIZE` definition and the read-only `WifiStore` class. This ensures compatibility between setup firmware and production firmware.
+**Note:** Web3E v1.47 uses 2048-byte EEPROM (up from 1024 in prior versions) to store a signed RPC cache at offset 828+. Setup firmware MUST match this size to prevent EEPROM truncation during OTA transitions between setup and app firmware.
 
 ## License
 
