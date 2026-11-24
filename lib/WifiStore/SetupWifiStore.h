@@ -33,11 +33,14 @@
 // Header + max networks * (1+32+1+64) + terminator + CRC
 #define WIFI_MAX_STORAGE_SIZE (WIFI_HEADER_SIZE + (MAX_WIFI_NETWORKS * (1 + MAX_SSID_LENGTH + 1 + MAX_PASSWORD_LENGTH)) + WIFI_TERMINATOR_SIZE + WIFI_CRC_SIZE)
 
-// Use WEB3E_EEPROM_SIZE if available (from Web3E master), otherwise calculate
+// Web3E v1.47+ uses 2048-byte EEPROM to store signed RPC cache (offset 828+).
+// Setup firmware MUST match app firmware EEPROM size to avoid truncation during OTA.
+// Revoke flag and power-cycle counter are in NVS (Preferences), not EEPROM.
 #ifdef WEB3E_EEPROM_SIZE
 #define TOTAL_EEPROM_SIZE WEB3E_EEPROM_SIZE
 #else
-#define TOTAL_EEPROM_SIZE (WIFI_EEPROM_OFFSET + WIFI_MAX_STORAGE_SIZE)
+// Fallback for local builds without Web3E: match v1.47 default
+#define TOTAL_EEPROM_SIZE 2048
 #endif
 
 // Forward declare WifiCredential if not already defined by Web3E
