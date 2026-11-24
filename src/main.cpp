@@ -12,6 +12,7 @@
 #include <Web3.h>
 #include <KeyID.h>
 #include "SetupWifiStore.h"
+#include "PortalBoot.h"
 
 // Configuration from build flags
 #ifndef PROXY_BASE_URL
@@ -52,6 +53,7 @@
 
 // Global objects
 SetupWifiStore wifiStore;
+PortalBoot portalBoot;
 DNSServer dnsServer;
 WebServer webServer(WEB_SERVER_PORT);
 KeyID* deviceKey = nullptr;
@@ -66,10 +68,12 @@ size_t firmwareSize = 0;
 unsigned long lastScanTime = 0;
 bool scanInProgress = false;
 int lastScanCount = 0;
+String cachedScanJson = "{\"scanning\":false,\"networks\":[]}";
 bool otaInProgress = false;
 String otaStatus = "";
 String lastFailedSSID = "";
 String lastFailReason = "";
+bool forcePortalMode = false; // revoke flag or triple power-cycle
 
 // Forward declarations
 void setupAccessPoint();
@@ -78,11 +82,14 @@ void initializeDeviceKey();
 bool connectToStoredNetworks();
 bool queryProxyForFirmware();
 bool downloadAndFlashFirmware();
-void startWifiScan();
+void startWifiScan(bool userRequested);
 void checkScanProgress();
+void restoreApOnlyMode();
+bool apHasConnectedClients();
 String scanNetworks();
 void handleRoot();
 void handleScan();
+void handleRefresh();
 void handleSave();
 void handleList();
 void handleRemove();
@@ -134,37 +141,53 @@ void setup() {
         Serial.println("ERROR: Failed to initialize EEPROM for WifiStore");
         ESP.restart();
     }
-    
-    // Try to connect to stored Wi-Fi networks
-    if (connectToStoredNetworks()) {
-        Serial.println("Connected to Wi-Fi!");
-        wifiConnected = true;
-        
-        // Query proxy or use direct URL
-        if (queryProxyForFirmware()) {
-            Serial.println("Firmware metadata retrieved, starting OTA update...");
-            if (downloadAndFlashFirmware()) {
-                Serial.println("OTA update successful! Rebooting...");
-                delay(2000);
-                ESP.restart();
-            } else {
-                Serial.println("OTA update failed, starting captive portal for recovery");
-                wifiConnected = false;
-            }
-        } else {
-            Serial.println("Failed to get firmware metadata, starting captive portal");
-            wifiConnected = false;
+
+    // NVS portal/boot control (shared with app firmware). Does not touch EEPROM.
+    if (!portalBoot.begin()) {
+        Serial.println("WARNING: PortalBoot NVS unavailable — continuing without flag");
+    } else {
+        forcePortalMode = portalBoot.checkAndHandlePowerCycle();
+        if (forcePortalMode) {
+            Serial.println("Stay-in-portal active (revoke flag and/or triple power-cycle)");
+            Serial.println("Saved Wi-Fi credentials are preserved for portal pre-fill");
         }
     }
     
-    // If we reach here, either no networks stored or connection failed
+    // Auto-connect + OTA only when NOT forced to stay in portal.
+    // Wi-Fi down alone never opens the AP; only missing creds, failed connect,
+    // stay_portal, or triple power-cycle lead to the portal path below.
+    if (!forcePortalMode) {
+        if (connectToStoredNetworks()) {
+            Serial.println("Connected to Wi-Fi!");
+            wifiConnected = true;
+            
+            if (queryProxyForFirmware()) {
+                Serial.println("Firmware metadata retrieved, starting OTA update...");
+                if (downloadAndFlashFirmware()) {
+                    Serial.println("OTA update successful! Rebooting...");
+                    delay(2000);
+                    ESP.restart();
+                } else {
+                    Serial.println("OTA update failed, starting captive portal for recovery");
+                    wifiConnected = false;
+                }
+            } else {
+                Serial.println("Failed to get firmware metadata, starting captive portal");
+                wifiConnected = false;
+            }
+        }
+    } else {
+        Serial.println("Skipping auto Wi-Fi connect / app OTA (stay-in-portal)");
+    }
+    
+    // If we reach here, either no networks stored, connection failed, or stay-in-portal
     Serial.println("Starting captive portal for Wi-Fi configuration...");
     setupAccessPoint();
     setupWebServer();
     
-    // Start initial Wi-Fi scan
+    // Single scan at boot only (no periodic rescan — that breaks classic ESP32 AP)
     Serial.println("Starting initial Wi-Fi scan...");
-    startWifiScan();
+    startWifiScan(false);
 #endif
 }
 
@@ -172,8 +195,11 @@ void loop() {
     dnsServer.processNextRequest();
     webServer.handleClient();
     
-    // Check scan progress and restart periodically
+    // Complete in-progress scan; do NOT auto-restart scans on a timer
     checkScanProgress();
+
+    // Clear quick-reboot counter after stable uptime (~10s)
+    portalBoot.clearBootCountIfStable(millis());
     
     // Check if Wi-Fi was configured and we should retry OTA
     if (wifiConnected && firmwareDownloadUrl.length() > 0) {
@@ -602,6 +628,7 @@ void setupAccessPoint() {
 void setupWebServer() {
     webServer.on("/", handleRoot);
     webServer.on("/scan", handleScan);
+    webServer.on("/refresh", HTTP_POST, handleRefresh);
     webServer.on("/save", HTTP_POST, handleSave);
     webServer.on("/list", handleList);
     webServer.on("/remove", HTTP_POST, handleRemove);
@@ -613,78 +640,111 @@ void setupWebServer() {
     Serial.println("Web server started on port 80");
 }
 
-void startWifiScan() {
-    if (!scanInProgress) {
-        WiFi.mode(WIFI_AP_STA);
-        WiFi.scanNetworks(true);
-        scanInProgress = true;
-        lastScanTime = millis();
-        Serial.println("Wi-Fi scan started (async)");
+bool apHasConnectedClients() {
+    return WiFi.softAPgetStationNum() > 0;
+}
+
+void restoreApOnlyMode() {
+    // Stay in AP-only mode after scans so the softAP stays responsive on classic ESP32.
+    // WIFI_AP_STA during idle scanning is what made 192.168.4.1 flake out.
+    if (WiFi.getMode() == WIFI_AP_STA && WiFi.status() != WL_CONNECTED) {
+        WiFi.mode(WIFI_AP);
+        Serial.println("Restored WIFI_AP mode after scan");
     }
 }
 
-void checkScanProgress() {
+void startWifiScan(bool userRequested) {
     if (scanInProgress) {
-        int n = WiFi.scanComplete();
-        if (n >= 0) {
-            lastScanCount = n;
-            scanInProgress = false;
-            Serial.printf("Wi-Fi scan complete: %d networks found\n", n);
-        } else if (n == WIFI_SCAN_FAILED) {
-            scanInProgress = false;
-            Serial.println("Wi-Fi scan failed");
-        }
+        Serial.println("Wi-Fi scan already in progress");
+        return;
     }
-    
-    if (!scanInProgress && (millis() - lastScanTime > 12000)) {
-        startWifiScan();
+
+    // Never auto/boot-scan while a phone is already on the AP — that is what
+    // made classic ESP32 softAP stop answering 192.168.4.1. Explicit Refresh
+    // is allowed (user-initiated); restoreApOnlyMode() runs when scan ends.
+    if (!userRequested && apHasConnectedClients()) {
+        Serial.println("Skipping auto Wi-Fi scan: AP client connected");
+        return;
     }
+
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.scanNetworks(true);
+    scanInProgress = true;
+    lastScanTime = millis();
+    Serial.printf("Wi-Fi scan started (async, userRequested=%s)\n",
+                  userRequested ? "true" : "false");
 }
 
-String scanNetworks() {
-    int n = WiFi.scanComplete();
-    
-    if (n == WIFI_SCAN_RUNNING) {
-        return "{\"scanning\":true,\"networks\":[]}";
-    } else if (n == WIFI_SCAN_FAILED) {
-        return "{\"scanning\":false,\"networks\":[]}";
-    } else if (n >= 0) {
-        String json = "{\"scanning\":false,\"networks\":[";
-        
-        bool seen[n];
-        for (int i = 0; i < n; i++) seen[i] = false;
-        
-        for (int i = 0; i < n; i++) {
-            if (seen[i]) continue;
-            
-            String ssid = WiFi.SSID(i);
-            int bestRSSI = WiFi.RSSI(i);
-            int bestIdx = i;
-            bool encrypted = (WiFi.encryptionType(i) != WIFI_AUTH_OPEN);
-            
-            for (int j = i + 1; j < n; j++) {
-                if (!seen[j] && WiFi.SSID(j) == ssid) {
-                    seen[j] = true;
-                    if (WiFi.RSSI(j) > bestRSSI) {
-                        bestRSSI = WiFi.RSSI(j);
-                        bestIdx = j;
-                    }
-                }
-            }
-            
-            seen[bestIdx] = true;
-            
-            if (i > 0) json += ",";
-            json += "{\"ssid\":\"" + ssid + "\",";
-            json += "\"rssi\":" + String(bestRSSI) + ",";
-            json += "\"encrypted\":" + String(encrypted ? "true" : "false") + "}";
-        }
-        
+String buildScanJsonFromResults(int n) {
+    String json = "{\"scanning\":false,\"networks\":[";
+
+    if (n <= 0) {
         json += "]}";
         return json;
     }
-    
-    return "{\"scanning\":false,\"networks\":[]}";
+
+    bool seen[n];
+    for (int i = 0; i < n; i++) seen[i] = false;
+
+    bool first = true;
+    for (int i = 0; i < n; i++) {
+        if (seen[i]) continue;
+
+        String ssid = WiFi.SSID(i);
+        int bestRSSI = WiFi.RSSI(i);
+        int bestIdx = i;
+        bool encrypted = (WiFi.encryptionType(i) != WIFI_AUTH_OPEN);
+
+        for (int j = i + 1; j < n; j++) {
+            if (!seen[j] && WiFi.SSID(j) == ssid) {
+                seen[j] = true;
+                if (WiFi.RSSI(j) > bestRSSI) {
+                    bestRSSI = WiFi.RSSI(j);
+                    bestIdx = j;
+                }
+            }
+        }
+
+        seen[bestIdx] = true;
+
+        if (!first) json += ",";
+        first = false;
+        json += "{\"ssid\":\"" + ssid + "\",";
+        json += "\"rssi\":" + String(bestRSSI) + ",";
+        json += "\"encrypted\":" + String(encrypted ? "true" : "false") + "}";
+    }
+
+    json += "]}";
+    return json;
+}
+
+void checkScanProgress() {
+    if (!scanInProgress) {
+        return;
+    }
+
+    int n = WiFi.scanComplete();
+    if (n >= 0) {
+        lastScanCount = n;
+        scanInProgress = false;
+        // Cache before mode switch — AP_STA→AP can drop live scan results
+        cachedScanJson = buildScanJsonFromResults(n);
+        Serial.printf("Wi-Fi scan complete: %d networks found\n", n);
+        WiFi.scanDelete();
+        restoreApOnlyMode();
+    } else if (n == WIFI_SCAN_FAILED) {
+        scanInProgress = false;
+        Serial.println("Wi-Fi scan failed");
+        restoreApOnlyMode();
+    }
+    // No periodic rescan — only boot + explicit /refresh
+}
+
+String scanNetworks() {
+    if (scanInProgress) {
+        return "{\"scanning\":true,\"networks\":[]}";
+    }
+    return cachedScanJson;
 }
 
 void handleRoot() {
@@ -733,12 +793,18 @@ void handleRoot() {
         "<h1>" + appName + " Setup</h1>"
         "<p class=\"subtitle\">Web3E Setup</p>"
         "<div class=\"device-info\"><strong>Device Address:</strong> " + deviceAddr + "</div>"
-        "<div id=\"status\" class=\"status\"></div>"
+        + String(forcePortalMode
+            ? "<div class=\"status info\" style=\"display:block\">Setup portal held open "
+              "(revoke or triple power-cycle). Saved Wi-Fi is kept — review and tap Done "
+              "to reconnect and install firmware.</div>"
+            : "")
+        + "<div id=\"status\" class=\"status\"></div>"
         "<h2>Select Network</h2>"
         "<label>Available Networks <span id=\"scan-status\" class=\"scanning\">Scanning...</span></label>"
         "<select id=\"network-select\" onchange=\"onNetworkSelected()\">"
         "<option value=\"\">-- Select a network --</option>"
         "</select>"
+        "<button type=\"button\" onclick=\"refreshNetworks()\" style=\"margin-top:8px\">Refresh Networks</button>"
         "<div id=\"network-pwd-section\" class=\"hidden\">"
         "<label>Password</label>"
         "<div class=\"pwd-wrapper\"><input type=\"password\" id=\"network-password\" placeholder=\"Enter password\">"
@@ -758,6 +824,7 @@ void handleRoot() {
         "let networksData=[];"
         "let networksBySsid={};"
         "let statusPollInterval=null;"
+        "let scanPollInterval=null;"
         "let selectFocused=false;"
         "let userHasSelected=false;"
         "function showStatus(msg,type){"
@@ -767,14 +834,12 @@ void handleRoot() {
         "function togglePassword(id){"
         "const inp=document.getElementById(id);"
         "inp.type=inp.type==='password'?'text':'password';}"
-        "function pollNetworks(){"
-        "if(selectFocused){return;}"
-        "fetch('/scan').then(r=>r.json()).then(data=>{"
+        "function applyNetworkList(data){"
         "const status=document.getElementById('scan-status');"
         "const sel=document.getElementById('network-select');"
         "if(data.scanning){status.textContent='Scanning...';return;}"
         "status.textContent='';"
-        "if(!data.networks||data.networks.length===0){return;}"
+        "if(!data.networks){return;}"
         "const currentSSID=sel.value;"
         "networksData=data.networks;"
         "networksBySsid={};"
@@ -788,7 +853,19 @@ void handleRoot() {
         "opt.dataset.encrypted=net.encrypted;"
         "sel.appendChild(opt);});"
         "if(currentSSID&&networksBySsid[currentSSID]){sel.value=currentSSID;}"
+        "if(data.networks.length===0){status.textContent='No networks — tap Refresh';}}"
+        "function pollNetworks(){"
+        "if(selectFocused){return;}"
+        "fetch('/scan').then(r=>r.json()).then(data=>{"
+        "applyNetworkList(data);"
+        "if(!data.scanning&&scanPollInterval){clearInterval(scanPollInterval);scanPollInterval=null;}"
         "}).catch(e=>console.log(e));}"
+        "function refreshNetworks(){"
+        "document.getElementById('scan-status').textContent='Scanning...';"
+        "fetch('/refresh',{method:'POST'}).then(r=>r.json()).then(data=>{"
+        "if(!scanPollInterval){scanPollInterval=setInterval(pollNetworks,1000);}"
+        "pollNetworks();"
+        "}).catch(e=>{showStatus('Refresh failed','error');});}"
         "document.getElementById('network-select').addEventListener('focus',()=>{selectFocused=true;});"
         "document.getElementById('network-select').addEventListener('blur',()=>{selectFocused=false;});"
         "function onNetworkSelected(){"
@@ -862,7 +939,8 @@ void handleRoot() {
         "clearInterval(statusPollInterval);"
         "}}).catch(e=>{});},2000);}"
         "pollNetworks();"
-        "setInterval(pollNetworks,3000);"
+        "scanPollInterval=setInterval(pollNetworks,1000);"
+        "setTimeout(()=>{if(scanPollInterval){clearInterval(scanPollInterval);scanPollInterval=null;}},20000);"
         "loadSavedNetworks();"
         "</script></body></html>";
     
@@ -871,6 +949,19 @@ void handleRoot() {
 
 void handleScan() {
     webServer.send(200, "application/json", scanNetworks());
+}
+
+void handleRefresh() {
+    // Explicit user refresh only — no periodic rescans.
+    if (scanInProgress) {
+        webServer.send(200, "application/json", "{\"ok\":true,\"scanning\":true}");
+        return;
+    }
+    startWifiScan(true);
+    webServer.send(200, "application/json",
+                   scanInProgress
+                       ? "{\"ok\":true,\"scanning\":true}"
+                       : "{\"ok\":false,\"scanning\":false,\"reason\":\"scan_not_started\"}");
 }
 
 void handleSave() {
@@ -943,6 +1034,14 @@ void handleDone() {
     }
     
     Serial.printf("Attempting to connect to %d saved network(s)...\n", count);
+
+    // User confirmed re-provision: clear stay-in-portal so future boots can
+    // auto-connect again. Wi-Fi EEPROM credentials are left intact.
+    if (portalBoot.isInitialized()) {
+        portalBoot.clearStayInPortal();
+        forcePortalMode = false;
+        Serial.println("Cleared stay_portal flag (user confirmed Done)");
+    }
     
     otaInProgress = true;
     otaStatus = "Connecting to Wi-Fi...";
